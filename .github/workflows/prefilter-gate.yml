@@ -1,0 +1,103 @@
+name: Prefilter gate
+
+# Retrains the CatBoost URL prefilter from the public feeds and refuses to let a
+# candidate through unless it clears the minimum bar in ml/evaluation/gate.py.
+#
+# A red run here does NOT mean the repository is broken. It means a *candidate*
+# model missed its own bar (for example, a false-positive rate above the ceiling
+# on benign URLs that carry a path) and `ml/training/train_prefilter.py` exited
+# non-zero without writing anything, so whatever model is already deployed is
+# untouched. The gate report is uploaded as an artifact and printed at the end of
+# the job. That is the intended behaviour: an unusable model must not ship just
+# because training finished.
+#
+# The pipeline is evaluated with a leakage-free, time-ordered split whenever the
+# feeds carry real observation timestamps (PhishTank `submission_time` for
+# phishing, Internet Archive capture times for benign), so the headline number is
+# a genuine zero-day detection rate rather than a random-split estimate.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly: the feeds move, so the gate is re-checked on fresh data.
+    - cron: "0 4 * * 1"
+  push:
+    paths:
+      - "ml/**"
+      - "scripts/data/**"
+      - "backend/app/ml/**"
+      - "backend/app/scoring/**"
+      - "backend/app/schemas/analysis.py"
+      - ".github/workflows/prefilter-gate.yml"
+  pull_request:
+    paths:
+      - "ml/**"
+      - "scripts/data/**"
+      - "backend/app/ml/**"
+      - "backend/app/scoring/**"
+      - "backend/app/schemas/analysis.py"
+      - ".github/workflows/prefilter-gate.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  retrain-and-gate:
+    name: Retrain prefilter and enforce the deployment gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ML dependencies
+        run: pip install -r ml/requirements.txt
+
+      # Opt-in by design (see the script docstrings): only public feeds, only
+      # into data/raw/, never committed.
+      - name: Download public training feeds
+        run: python scripts/data/download_data.py --confirm
+
+      # The Internet Archive is a third party that rate-limits, so this step is
+      # allowed to fail. Without it the dataset keeps its bare-homepage benign
+      # rows only, which is exactly the structural confound the gate's
+      # benign-with-path check exists to catch.
+      - name: Collect benign deep URLs with observation timestamps
+        continue-on-error: true
+        run: python scripts/data/fetch_benign_urls.py --confirm --max-domains 300 --target 4000
+
+      - name: Build the labeled dataset
+        run: python scripts/data/prepare_dataset.py
+
+      - name: Retrain and enforce the deployment gate
+        run: python ml/training/train_prefilter.py --data data/processed/prefilter_dataset.csv
+
+      - name: Publish the evaluation report
+        if: always()
+        continue-on-error: true
+        run: python ml/evaluation/report.py --data data/processed/prefilter_dataset.csv
+
+      - name: Explain a refused candidate
+        if: failure()
+        run: |
+          echo "::error title=Prefilter gate::A candidate model was refused deployment. See the gate report below."
+          for f in ml/evaluation/reports/train_gate.md ml/evaluation/reports/latest.md; do
+            if [ -f "$f" ]; then
+              echo "----- $f -----"
+              cat "$f"
+            fi
+          done
+
+      - name: Upload gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prefilter-gate-report
+          path: |
+            ml/evaluation/reports/*.md
+            ml/evaluation/reports/*.json
+          if-no-files-found: warn

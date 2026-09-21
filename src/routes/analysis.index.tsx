@@ -1,0 +1,359 @@
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useServerFn } from "@tanstack/react-start";
+import { useState } from "react";
+import { FlaskConical, Loader2, Mail, ScanSearch } from "lucide-react";
+import { AppShell } from "@/components/phishbrain/AppShell";
+import { AnalysisReport } from "@/components/phishbrain/AnalysisReport";
+import { api, BackendRejectedError, BackendUnavailableError } from "@/lib/phishbrain/api";
+import { analyzeDemo, DEMO_SAMPLES, saveDemoAnalysis } from "@/lib/phishbrain/demo";
+import { liveAnalyzeUrl, liveAnalyzeEmail } from "@/lib/phishbrain/scan.functions";
+import type { AnalysisResult } from "@/lib/phishbrain/types";
+import { usePhishbrainSettings } from "@/lib/phishbrain/usePhishbrainSettings";
+
+export const Route = createFileRoute("/analysis/")({
+  head: () => ({
+    meta: [
+      { title: "Analyze a URL — PhishBrain" },
+      {
+        name: "description",
+        content:
+          "Run the PhishBrain multi-layer pipeline on a URL: URL, domain, webpage and email evidence combined with local LLM reasoning and explainable 0-100 threat scoring.",
+      },
+      { property: "og:title", content: "Analyze a URL — PhishBrain" },
+      {
+        property: "og:description",
+        content:
+          "Multi-layer phishing analysis with explainable 0-100 threat scoring, running entirely on local open-source components.",
+      },
+    ],
+  }),
+  component: AnalyzePage,
+});
+
+function AnalyzePage() {
+  const { settings } = usePhishbrainSettings();
+  const navigate = useNavigate();
+  const scanLive = useServerFn(liveAnalyzeUrl);
+  const scanEmail = useServerFn(liveAnalyzeEmail);
+  const [mode, setMode] = useState<"url" | "email">("url");
+  const [email, setEmail] = useState({
+    from: "",
+    reply_to: "",
+    display_name: "",
+    subject: "",
+    body: "",
+  });
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [result, setResult] = useState<AnalysisResult | null>(null);
+
+  async function run(target: string, demoIndex?: number) {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    setResult(null);
+
+    // Synthetic demo samples are never contacted over the network.
+    if (demoIndex !== undefined) {
+      const sample = DEMO_SAMPLES[demoIndex];
+      const demo = analyzeDemo(sample ?? { url: target });
+      saveDemoAnalysis(demo);
+      setResult(demo);
+      setNotice("DEMO DATA — synthetic sample scored offline; no live request was made.");
+      setBusy(false);
+      return;
+    }
+
+    // 1. Self-hosted FastAPI backend (full pipeline incl. Ollama + Playwright).
+    try {
+      const res = await api.analyzeUrl(target);
+      setResult(res);
+      setBusy(false);
+      return;
+    } catch (err) {
+      // The backend answered and refused the target (bad scheme, unresolvable
+      // host, a guard decision). That is an answer, not an outage: report the
+      // backend's own reason instead of silently re-scanning without the ML
+      // pre-filter, LLM reasoning or screenshot layers.
+      if (err instanceof BackendRejectedError) {
+        setError(
+          `The backend refused this target: ${err.detail} (HTTP ${err.status}). ` +
+            "No result was produced, because the built-in scanner would have skipped the ML pre-filter, LLM and visual layers.",
+        );
+        return;
+      }
+      const detail = err instanceof BackendUnavailableError ? err.detail : String(err);
+      // 2. Built-in live scan engine: real fetch, DNS, RDAP and DOM parsing.
+      try {
+        const raw = await scanLive({
+          data: {
+            url: target,
+            safeThreshold: settings.safeThreshold,
+            suspiciousThreshold: settings.suspiciousThreshold,
+          },
+        });
+        const live = JSON.parse(raw as unknown as string) as AnalysisResult;
+        saveDemoAnalysis(live);
+        setResult(live);
+        setNotice(
+          `LIVE SCAN (REDUCED LAYERS) — the FastAPI backend could not be reached (${detail}), so this result came from the built-in scanner: real HTTP fetch, DNS, RDAP and DOM analysis. The ML pre-filter, LLM reasoning and screenshot/brand-clone layers all live in the backend, so none of them were applied to this score.`,
+        );
+      } catch (liveErr) {
+        const liveDetail = liveErr instanceof Error ? liveErr.message : String(liveErr);
+        if (settings.demoMode) {
+          const demo = analyzeDemo({ url: target });
+          saveDemoAnalysis(demo);
+          setResult(demo);
+          setError(
+            `Live scan failed (${liveDetail}). Demo Mode produced this DEMO DATA result from URL features only.`,
+          );
+        } else {
+          setError(`Analysis failed. Backend: ${detail}. Live scan: ${liveDetail}`);
+        }
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runEmail() {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    setResult(null);
+    try {
+      const links = Array.from(new Set(email.body.match(/https?:\/\/[^\s<>"')]+/gi) ?? [])).slice(
+        0,
+        50,
+      );
+      const raw = await scanEmail({
+        data: {
+          from: email.from || undefined,
+          reply_to: email.reply_to || undefined,
+          display_name: email.display_name || undefined,
+          subject: email.subject || undefined,
+          body: email.body || undefined,
+          links,
+          safeThreshold: settings.safeThreshold,
+          suspiciousThreshold: settings.suspiciousThreshold,
+        },
+      });
+      const res = JSON.parse(raw as unknown as string) as AnalysisResult;
+      saveDemoAnalysis(res);
+      setResult(res);
+      setNotice(
+        links.length
+          ? `LIVE EMAIL SCAN — sender and content scored, and the first link (${links[0]}) was fetched for URL, domain and webpage evidence.`
+          : "LIVE EMAIL SCAN — sender and content scored. The message contained no link to fetch.",
+      );
+    } catch (err) {
+      setError(`Email analysis failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const field =
+    "w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring";
+
+  return (
+    <AppShell
+      title="Analyze"
+      description="Run the full CAPTURE → PARSE → PRE-FILTER → MULTI-LAYER → LLM → SCORE pipeline"
+    >
+      <div className="mb-3 flex gap-2">
+        {(
+          [
+            ["url", "URL / website", ScanSearch],
+            ["email", "Email message", Mail],
+          ] as const
+        ).map(([id, label, Icon]) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => setMode(id)}
+            className={`inline-flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm font-medium ${
+              mode === id
+                ? "border-primary bg-primary/10 text-primary"
+                : "border-border bg-secondary text-muted-foreground hover:bg-accent"
+            }`}
+          >
+            <Icon aria-hidden="true" className="size-4" /> {label}
+          </button>
+        ))}
+      </div>
+
+      {mode === "email" ? (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            void runEmail();
+          }}
+          className="panel grid gap-3 p-4"
+        >
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="text-xs text-muted-foreground">
+              From address
+              <input
+                value={email.from}
+                onChange={(e) => setEmail({ ...email, from: e.target.value })}
+                placeholder="billing@secure-paypa1.com"
+                className={field}
+              />
+            </label>
+            <label className="text-xs text-muted-foreground">
+              Reply-To address
+              <input
+                value={email.reply_to}
+                onChange={(e) => setEmail({ ...email, reply_to: e.target.value })}
+                placeholder="recover@mail.ru"
+                className={field}
+              />
+            </label>
+            <label className="text-xs text-muted-foreground">
+              Display name
+              <input
+                value={email.display_name}
+                onChange={(e) => setEmail({ ...email, display_name: e.target.value })}
+                placeholder="PayPal Support"
+                className={field}
+              />
+            </label>
+            <label className="text-xs text-muted-foreground">
+              Subject
+              <input
+                value={email.subject}
+                onChange={(e) => setEmail({ ...email, subject: e.target.value })}
+                placeholder="Your account will be suspended"
+                className={field}
+              />
+            </label>
+          </div>
+          <label className="text-xs text-muted-foreground">
+            Message body (paste the full text — links inside are extracted and scanned live)
+            <textarea
+              value={email.body}
+              onChange={(e) => setEmail({ ...email, body: e.target.value })}
+              rows={8}
+              className={field}
+            />
+          </label>
+          <button
+            type="submit"
+            disabled={busy || (!email.body.trim() && !email.from.trim())}
+            className="inline-flex w-fit items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+          >
+            {busy ? (
+              <Loader2 aria-hidden="true" className="size-4 animate-spin" />
+            ) : (
+              <Mail aria-hidden="true" className="size-4" />
+            )}
+            Analyze email
+          </button>
+        </form>
+      ) : (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (url.trim()) void run(url.trim());
+          }}
+          className="panel flex flex-wrap items-center gap-2 p-4"
+        >
+          <label htmlFor="target-url" className="sr-only">
+            URL to analyze
+          </label>
+          <input
+            id="target-url"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://example.com/login"
+            className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          />
+          <button
+            type="submit"
+            disabled={busy || !url.trim()}
+            className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+          >
+            {busy ? (
+              <Loader2 aria-hidden="true" className="size-4 animate-spin" />
+            ) : (
+              <ScanSearch aria-hidden="true" className="size-4" />
+            )}
+            Analyze
+          </button>
+        </form>
+      )}
+
+      <section className="panel mt-4 p-4">
+        <h2 className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wider text-muted-foreground">
+          <FlaskConical aria-hidden="true" className="size-4" /> Demo samples — DEMO DATA
+        </h2>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Synthetic, safe-to-use examples. No live phishing URLs are contacted.
+        </p>
+        <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+          {DEMO_SAMPLES.map((s, idx) => (
+            <button
+              key={s.id}
+              type="button"
+              onClick={() => {
+                setUrl(s.url);
+                void run(s.url, idx);
+              }}
+              className="rounded-md border border-border bg-secondary/50 p-3 text-left transition-colors hover:bg-accent"
+            >
+              <span className="block text-sm font-medium">{s.label}</span>
+              <span className="mt-1 block text-xs text-muted-foreground">{s.description}</span>
+              <span className="mt-1 block truncate font-mono text-[11px] text-primary">
+                {s.url}
+              </span>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      {notice ? (
+        <p className="mt-4 rounded-md border border-primary/40 bg-primary/10 px-3 py-2 text-sm text-primary">
+          {notice}
+        </p>
+      ) : null}
+
+      {error ? (
+        <p className="mt-4 rounded-md border border-suspicious/40 bg-suspicious-soft px-3 py-2 text-sm text-suspicious">
+          {error}
+        </p>
+      ) : null}
+
+      {result ? (
+        <div className="mt-4">
+          <div className="mb-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => void run(result.target)}
+              className="rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-medium hover:bg-accent"
+            >
+              Rescan
+            </button>
+            {!result.demo ? (
+              <button
+                type="button"
+                onClick={() =>
+                  navigate({
+                    to: "/analysis/$analysisId",
+                    params: { analysisId: result.analysis_id },
+                  })
+                }
+                className="rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-medium hover:bg-accent"
+              >
+                Open permalink
+              </button>
+            ) : null}
+          </div>
+          <AnalysisReport result={result} />
+        </div>
+      ) : null}
+    </AppShell>
+  );
+}

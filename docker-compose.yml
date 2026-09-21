@@ -1,0 +1,70 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-phishbrain}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-phishbrain}
+      POSTGRES_DB: ${POSTGRES_DB:-phishbrain}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  valkey:
+    image: valkey/valkey:7-alpine
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+      - ./docker/ollama-init.sh:/usr/local/bin/ollama-init.sh
+    entrypoint: /usr/local/bin/ollama-init.sh
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-phishbrain}:${POSTGRES_PASSWORD:-phishbrain}@postgres:5432/${POSTGRES_DB:-phishbrain}
+      - CACHE_URL=redis://valkey:6379/0
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - APP_ENV=production
+    env_file:
+      - .env.example
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    ports:
+      - "8080:8080"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  ollama_data:

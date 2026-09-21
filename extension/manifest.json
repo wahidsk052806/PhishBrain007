@@ -1,0 +1,63 @@
+{
+  "manifest_version": 3,
+  "name": "PhishBrain007",
+  "version": "1.0.0",
+  "description": "Real-time phishing and scam detection for the web, email and pages you browse. Powered by PhishBrain007.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "storage",
+    "activeTab",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*",
+    "http://localhost:8000/*",
+    "http://127.0.0.1:8000/*",
+    "https://www.phishbrain07.app/*",
+    "https://phishbrain07.app/*",
+    "https://phishbrain007.lovable.app/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "phishbrain@extension.local",
+      "strict_min_version": "109.0"
+    }
+  }
+}

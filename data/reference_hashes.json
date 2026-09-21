@@ -1,0 +1,394 @@
+{
+  "version": 3,
+  "generated_at": "2026-09-21T18:57:33.726868+00:00",
+  "description": "Brand references for backend/app/analyzers/webpage/visual.py. 'favicons' are stable brand-icon hashes and are what identify a clone (an exact copy is 0 bits away, distinct brands are 20+ apart). 'references' are homepage/sign-in screenshots, used only as a coarse similarity figure because live pages drift from their own captures.",
+  "favicons": {
+    "adobe": [
+      {
+        "url": "https://www.adobe.com/favicon.ico",
+        "phash": "c61b6c3033ec33e5",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 15086
+      }
+    ],
+    "amazon": [
+      {
+        "url": "https://www.amazon.com/favicon.ico",
+        "phash": "857554db853554cb",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 15086
+      }
+    ],
+    "apple": [
+      {
+        "url": "https://www.apple.com/favicon.ico",
+        "phash": "a4c6cf61389b65cc",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 22382
+      }
+    ],
+    "bankofamerica": [
+      {
+        "url": "https://www.bankofamerica.com/homepage/spa-assets/images/assets-images-global-favicon-apple-touch-icon-CSX889b28c.png",
+        "phash": "ae19d1e4191ea5e9",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 7888
+      }
+    ],
+    "chase": [
+      {
+        "url": "https://www.chase.com/etc/designs/chase-ux/favicon-152.png",
+        "phash": "fac5a1ca9e109e3c",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 2409
+      }
+    ],
+    "docusign": [
+      {
+        "url": "https://www.docusign.com/assets/images/apple-touch-icon-57x57.png",
+        "phash": "9587db5565727092",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 590
+      }
+    ],
+    "dropbox": [
+      {
+        "url": "https://cfl.dropboxstatic.com/static/metaserver/static/images/favicon.ico",
+        "phash": "d2e3691c37398cc6",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 4286
+      }
+    ],
+    "facebook": [
+      {
+        "url": "https://static.xx.fbcdn.net/rsrc.php/y1/r/ay1hV6OlegS.ico",
+        "phash": "8c3334674f6c1e93",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 20366
+      }
+    ],
+    "google": [
+      {
+        "url": "https://www.gstatic.com/images/branding/searchlogo/ico/favicon.ico",
+        "phash": "ec94b14bceb49916",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 1322
+      }
+    ],
+    "instagram": [
+      {
+        "url": "https://static.cdninstagram.com/rsrc.php/yj/r/f01UdNyJjJj.webp",
+        "phash": "d5364a2d6b3c3c32",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 1834
+      }
+    ],
+    "linkedin": [
+      {
+        "url": "https://static.licdn.com/aero-v1/sc/h/al2o9zrvru7aqj8e1x2rzsrca",
+        "phash": "ee6b39849c9ac465",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 24838
+      }
+    ],
+    "microsoft": [
+      {
+        "url": "https://www.microsoft.com/favicon.ico?v2",
+        "phash": "b34cb3b34c4cb391",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 17174
+      }
+    ],
+    "netflix": [
+      {
+        "url": "https://assets.nflxext.com/us/ffe/siteui/common/icons/nficon2016.png",
+        "phash": "c6cc665966996699",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 1755
+      }
+    ],
+    "office365": [
+      {
+        "url": "https://res.cdn.office.net/officehub/images/content/images/unauth-copilotcom/favicon-copilot-brand-refresh-23392c1f66.ico",
+        "phash": "d4601cf36b8c619f",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 7400
+      }
+    ],
+    "outlook": [
+      {
+        "url": "https://res.public.onecdn.static.microsoft/assets/mail/pwa/v4/pngs/apple-touch-icon.png",
+        "phash": "abc49413d679cb64",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 15472
+      }
+    ],
+    "paypal": [
+      {
+        "url": "https://www.paypalobjects.com/marketing/web/icons/monogram/pp64.png",
+        "phash": "b865c79ecac39c41",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 706
+      }
+    ],
+    "wellsfargo": [
+      {
+        "url": "https://www17.wellsfargomedia.com/assets/images/icons/apple-touch-icon_120x120.png",
+        "phash": "c2153d7fc645b113",
+        "captured_at": "2026-09-21T18:57:33.726868+00:00",
+        "bytes": 1650
+      }
+    ]
+  },
+  "references": {
+    "adobe": [
+      {
+        "url": "https://auth.services.adobe.com/en_US/sign-in",
+        "phash": "830313373737363e",
+        "captured_at": "2026-09-21T18:55:25.327432+00:00"
+      }
+    ],
+    "amazon": [
+      {
+        "url": null,
+        "phash": "8f0f0700f0f0f8fb",
+        "captured_at": null
+      },
+      {
+        "url": "https://www.amazon.com/",
+        "phash": "cf4bd04d0f4340df",
+        "captured_at": "2026-09-21T18:55:25.327432+00:00"
+      },
+      {
+        "url": "https://www.amazon.com/ap/signin",
+        "phash": "8f0f0f0fc3e0e1e1",
+        "captured_at": "2026-09-21T18:55:25.327432+00:00"
+      }
+    ],
+    "apple": [
+      {
+        "url": null,
+        "phash": "8003a3057ceae7fd",
+        "captured_at": null
+      },
+      {
+        "url": "https://www.apple.com/",
+        "phash": "90ebb2e3fac85a30",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://appleid.apple.com/sign-in",
+        "phash": "b7a71fc90dc122e2",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "bankofamerica": [
+      {
+        "url": "https://www.bankofamerica.com/",
+        "phash": "f9d68689e9707909",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://www.bankofamerica.com/online-banking/sign-in/",
+        "phash": "f292adad324ace31",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "chase": [
+      {
+        "url": "https://www.chase.com/",
+        "phash": "b4cbcb30f03534cb",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://www.chase.com/digital/online-banking",
+        "phash": "a9d79e28512f28d5",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "docusign": [
+      {
+        "url": "https://www.docusign.com/",
+        "phash": "c5b6b5cf34340d32",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://account.docusign.com/",
+        "phash": "b38b8c27319b3327",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "dropbox": [
+      {
+        "url": null,
+        "phash": "c95292ad6d5696a9",
+        "captured_at": null
+      },
+      {
+        "url": "https://www.dropbox.com/",
+        "phash": "8d55f453495c17c5",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://www.dropbox.com/login",
+        "phash": "a3898d27991727cd",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "facebook": [
+      {
+        "url": null,
+        "phash": "b36ccbc3c93c3425",
+        "captured_at": null
+      },
+      {
+        "url": "https://www.facebook.com/",
+        "phash": "b938c6c3781e9cb1",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://www.facebook.com/login",
+        "phash": "b839c786784799b8",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "google": [
+      {
+        "url": null,
+        "phash": "e9b6864939b64b49",
+        "captured_at": null
+      },
+      {
+        "url": "https://www.google.com/",
+        "phash": "f4d554d555d45470",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://accounts.google.com/signin",
+        "phash": "e493996c9b196693",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "instagram": [
+      {
+        "url": null,
+        "phash": "e76ea29390916d69",
+        "captured_at": null
+      },
+      {
+        "url": "https://www.instagram.com/",
+        "phash": "9ec1e11f43e03e93",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://www.instagram.com/accounts/login/",
+        "phash": "9ec1e11f43e03e93",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "linkedin": [
+      {
+        "url": null,
+        "phash": "ca03a5905a6fa5f6",
+        "captured_at": null
+      },
+      {
+        "url": "https://www.linkedin.com/",
+        "phash": "cb92b4e54a921d6b",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://www.linkedin.com/login",
+        "phash": "b389238d27278f27",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "microsoft": [
+      {
+        "url": null,
+        "phash": "896e347ecbb018c7",
+        "captured_at": null
+      },
+      {
+        "url": "https://www.microsoft.com/",
+        "phash": "bf1fc09027c33c36",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://login.microsoftonline.com/",
+        "phash": "8559713764739b29",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "netflix": [
+      {
+        "url": null,
+        "phash": "e4f93b3fc0c10d1c",
+        "captured_at": null
+      },
+      {
+        "url": "https://www.netflix.com/",
+        "phash": "9f9c603340cddab5",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://www.netflix.com/login",
+        "phash": "ccccf071739a3076",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "office365": [
+      {
+        "url": "https://www.office.com/",
+        "phash": "b36c86b38c2c33ce",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://login.microsoftonline.com/",
+        "phash": "8559713764739b29",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "outlook": [
+      {
+        "url": "https://outlook.live.com/",
+        "phash": "d72d6a05556c9aa5",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://login.live.com/",
+        "phash": "a359dc7672c87223",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "paypal": [
+      {
+        "url": null,
+        "phash": "99c6e63119c6ee31",
+        "captured_at": null
+      },
+      {
+        "url": "https://www.paypal.com/",
+        "phash": "f254d4dbf4708cd0",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://www.paypal.com/signin",
+        "phash": "b3e29ccc33d9990c",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ],
+    "wellsfargo": [
+      {
+        "url": "https://www.wellsfargo.com/",
+        "phash": "a27a6e0a7a792b0e",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      },
+      {
+        "url": "https://connect.secure.wellsfargo.com/auth/login/present",
+        "phash": "817d2b2939c17dc5",
+        "captured_at": "2026-09-21T18:51:08.506681+00:00"
+      }
+    ]
+  }
+}

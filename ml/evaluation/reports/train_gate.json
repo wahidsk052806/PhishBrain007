@@ -1,0 +1,153 @@
+{
+  "report": {
+    "generated_at": "2026-09-21T19:48:27.548297+00:00",
+    "status": "evaluated",
+    "dataset_path": "data\\processed\\prefilter_dataset.csv",
+    "model_path": "backend\\models\\prefilter.cbm",
+    "n_rows": 91772,
+    "n_train_rows": 67016,
+    "n_test_rows": 7959,
+    "decision_threshold": 0.5,
+    "feature_names": [
+      "brand_hyphenated",
+      "brand_impersonation",
+      "brand_leet_impersonation",
+      "brand_token_in_subdomain",
+      "brand_token_in_url",
+      "credential_path_token_count",
+      "digit_ratio",
+      "domain_entropy",
+      "domain_has_digit",
+      "has_at_symbol",
+      "has_https",
+      "has_ip_host",
+      "has_port",
+      "hostname_length",
+      "is_free_host",
+      "is_punycode",
+      "is_shortener",
+      "num_digits",
+      "num_dots",
+      "num_hyphens",
+      "num_percent_encoded",
+      "num_query_params",
+      "num_subdomains",
+      "path_depth",
+      "path_entropy",
+      "path_length",
+      "query_length",
+      "special_char_ratio",
+      "subdomain_count_gt_two",
+      "suspicious_keyword_count",
+      "suspicious_tld",
+      "tld_length",
+      "url_length"
+    ],
+    "structure_weights": true,
+    "structure_col": "structure",
+    "split_mode": "time",
+    "split": "time-ordered zero-day split at cutoff 2026-07-02 21:16:31+00:00 (7620 test rows dropped as same-domain-as-training)",
+    "zero_day": {
+      "cutoff": "2026-07-02 21:16:31+00:00",
+      "unseen_domains": 5294,
+      "test_rows_on_unseen_domains": 7855,
+      "test_phishing_rows_on_unseen_domains": 7849,
+      "timestamped_rows": 77893,
+      "undated_rows": 13879,
+      "timestamp_coverage": 0.8488,
+      "dedup_scope": "positives",
+      "negatives_domain_overlap": 104,
+      "dropped_leaked_rows": 7620,
+      "test_benign_rows": 110
+    },
+    "metrics": {
+      "accuracy": 0.8636763412489006,
+      "precision": 0.9982321744254566,
+      "recall": 0.8632946872213021,
+      "f1": 0.9258727881396461,
+      "roc_auc": 0.9443443866618793,
+      "true_negatives": 98,
+      "false_positives": 12,
+      "false_negatives": 1073,
+      "true_positives": 6776,
+      "false_positive_rate": 0.10909090909090909,
+      "false_positive_rate_benign_with_path": 0.05434782608695652,
+      "zero_day_detection_rate": 0.8632946872213021,
+      "mean_batch_latency_ms": 12.794859986752272,
+      "mean_per_sample_latency_ms": 0.0016075964300480302
+    }
+  },
+  "gate": {
+    "passed": false,
+    "checks": [
+      {
+        "metric": "recall",
+        "label": "Recall (phishing caught)",
+        "kind": "min",
+        "threshold": 0.9,
+        "observed": 0.8632946872213021,
+        "passed": false,
+        "why": "a prefilter that misses most phishing URLs is not doing its job"
+      },
+      {
+        "metric": "precision",
+        "label": "Precision",
+        "kind": "min",
+        "threshold": 0.85,
+        "observed": 0.9982321744254566,
+        "passed": true,
+        "why": "alerting on ordinary traffic destroys trust in the score"
+      },
+      {
+        "metric": "roc_auc",
+        "label": "ROC-AUC",
+        "kind": "min",
+        "threshold": 0.95,
+        "observed": 0.9443443866618793,
+        "passed": false,
+        "why": "the ranking must be separable, not just the 0.5 cut-off"
+      },
+      {
+        "metric": "false_positive_rate",
+        "label": "False positive rate (all benign)",
+        "kind": "max",
+        "threshold": 0.05,
+        "observed": 0.10909090909090909,
+        "passed": false,
+        "why": "benign browsing must not be flagged"
+      },
+      {
+        "metric": "false_positive_rate_benign_with_path",
+        "label": "False positive rate (benign URLs with a path)",
+        "kind": "max",
+        "threshold": 0.1,
+        "observed": 0.05434782608695652,
+        "passed": true,
+        "why": "catches a model that learned 'URL has a path' instead of phishing signals"
+      },
+      {
+        "metric": "mean_per_sample_latency_ms",
+        "label": "mean_per_sample_latency_ms",
+        "kind": "max",
+        "threshold": 5.0,
+        "observed": 0.0016075964300480302,
+        "passed": true,
+        "why": "the prefilter must stay cheap enough to run on every URL"
+      }
+    ],
+    "failures": [
+      "Recall (phishing caught): 0.8633 (required >= 0.9000)",
+      "ROC-AUC: 0.9443 (required >= 0.9500)",
+      "False positive rate (all benign): 0.1091 (required <= 0.0500)"
+    ]
+  },
+  "thresholds": {
+    "min_recall": 0.9,
+    "min_precision": 0.85,
+    "min_roc_auc": 0.95,
+    "max_false_positive_rate": 0.05,
+    "max_false_positive_rate_benign_path": 0.1,
+    "max_mean_per_sample_latency_ms": 5.0,
+    "extra": {}
+  }
+}
