@@ -6,7 +6,10 @@ COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 
 COPY . .
-RUN bun run build
+# The TanStack Start build defaults to a Cloudflare worker, which exports a
+# fetch handler and does NOT serve under `bun .output/server/index.mjs`. Force
+# the Node server preset so the runner stage below can actually start.
+RUN NITRO_PRESET=node-server bun run build
 
 FROM oven/bun:latest AS runner
 
