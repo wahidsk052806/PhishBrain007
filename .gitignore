@@ -47,6 +47,13 @@ backend/venv/
 extension/dist/
 extension/web-ext-artifacts/
 
+# Reference-capture scratch: the persistent Chrome profile and the per-run
+# capture report are machine-local artifacts (the shipped references and the
+# curated, committed gap list live in extension/data/).
+scripts/data/.tmp-profile/
+scripts/data/.tmp-screens/
+extension/data/reference_capture_report.json
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
