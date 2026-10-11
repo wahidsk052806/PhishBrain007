@@ -1,5 +1,5 @@
 import type { AnalysisResult, HealthStatus } from "./types";
-import { normalizeAnalysisResult } from "./normalize";
+import { normalizeAnalysisResult, normalizeTargetInput } from "./normalize";
 import { loadSettings } from "./settings";
 
 export class BackendUnavailableError extends Error {
@@ -80,7 +80,10 @@ export const api = {
       "/api/v1/analyze/url",
       {
         method: "POST",
-        body: JSON.stringify({ url, fetch_page: fetchPage }),
+        // Every request goes through the same normaliser as the form, so no
+        // caller can reintroduce the scheme-less target that used to be
+        // refused with "Scheme '' is not allowed".
+        body: JSON.stringify({ url: normalizeTargetInput(url), fetch_page: fetchPage }),
       },
       ANALYZE_TIMEOUT_MS,
     ).then(normalizeAnalysisResult),
@@ -108,6 +111,20 @@ export const api = {
     return { items: (res.items ?? []).map(normalizeAnalysisResult) };
   },
   clearHistory: () => request<{ deleted: number }>("/api/v1/history/clear", { method: "POST" }),
+  /** The backend's active screenshot-evidence retention policy. */
+  visualEvidencePolicy: () =>
+    request<{ retention_days: number; auto_purge_enabled: boolean; screenshot_mode: string }>(
+      "/api/v1/visual-evidence/policy",
+      { method: "GET" },
+      6000,
+    ),
+  /**
+   * Strip every stored screenshot thumbnail now, keeping the analyses. The
+   * backend purges aged evidence on its own clock; this is the one-click
+   * "stop storing what I looked at" action.
+   */
+  clearVisualEvidence: () =>
+    request<{ cleared: number }>("/api/v1/visual-evidence/clear", { method: "POST" }),
   feedback: (analysis_id: string, verdict: string, note: string) =>
     request<{ ok: boolean }>("/api/v1/feedback", {
       method: "POST",

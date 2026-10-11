@@ -16,6 +16,148 @@ import type { AnalysisResult, LayerEvidence, LayerName, RiskLevel } from "./type
 
 const LAYER_NAMES: LayerName[] = ["url", "domain", "webpage", "email"];
 
+/**
+ * Schemes a person may paste that are not web targets. They are passed through
+ * untouched so the backend guard can refuse them by name.
+ */
+const NON_WEB_SCHEMES = [
+  "javascript",
+  "data",
+  "file",
+  "ftp",
+  "ftps",
+  "blob",
+  "about",
+  "chrome",
+  "mailto",
+  "tel",
+  "sms",
+  "ws",
+  "wss",
+  "view-source",
+];
+
+/**
+ * Turn what a person types into an absolute http(s) URL.
+ *
+ * Typing `hianime.to` used to be sent to the backend verbatim, where the SSRF
+ * guard read an empty scheme and refused the whole request with
+ * `Scheme '' is not allowed`. Rejecting a bare hostname is not a security
+ * decision — every address bar accepts it — so it is normalised here, at the
+ * boundary, before either the backend or the built-in scanner sees it.
+ *
+ * Mirrors `normalize_url_input` in `backend/app/core/security.py`; the backend
+ * normalises as well, because it must not depend on its callers for this.
+ */
+export function normalizeTargetInput(raw: string): string {
+  if (typeof raw !== "string") return "";
+  let text = raw.trim();
+  if (!text) return "";
+  text = text
+    .replace(/^[<"']+/, "")
+    .replace(/[>"']+$/, "")
+    .trim();
+  if (!text) return "";
+  // Only the first whitespace-separated token: pasting a sentence containing a
+  // link is common, and the rest is never a host.
+  // A pasted sentence usually contains exactly one target. Prefer the token
+  // that is shaped like one (has a scheme, or contains a dot) over the first
+  // word, which is often prose.
+  const tokens = text.split(/\s+/).filter(Boolean);
+  text = (
+    tokens.find((t) => /^(https?:\/\/|\/\/)/i.test(t)) ??
+    tokens.find((t) => t.includes(".") && !t.startsWith(".")) ??
+    tokens[0] ??
+    text
+  ).slice(0, 2048);
+
+  const lower = text.toLowerCase();
+  if (NON_WEB_SCHEMES.some((scheme) => lower.startsWith(`${scheme}:`))) return text;
+
+  const explicit = /^(https?):(\/*)(.*)$/i.exec(text);
+  if (explicit) {
+    const scheme = (explicit[1] ?? "https").toLowerCase();
+    const slashes = explicit[2] ?? "";
+    const rest = explicit[3] ?? "";
+    if (slashes === "//" && rest) return `${scheme}://${rest}`;
+    // `https:/example.com` and `https:example.com` are both typos for a URL.
+    if (rest) return `${scheme}://${rest.replace(/^\/+/, "")}`;
+    return text;
+  }
+
+  if (text.startsWith("//")) return `https:${text}`;
+  return `https://${text}`;
+}
+
+/**
+ * Explain a machine-readable `degraded` code in a sentence.
+ *
+ * The report used to print the codes themselves (`webpage.fetch_failed`,
+ * `ml.deterministic_fallback`), which told a reader nothing about what was
+ * missing or why. Codes that are already sentences (the built-in scanner emits
+ * prose) are returned unchanged.
+ */
+const FETCH_FAILURE_REASONS: Record<string, string> = {
+  ConnectTimeout:
+    "the connection attempt timed out — the host is unreachable from this network (firewall, geo-block, or the site is down)",
+  ConnectError: "the host refused or dropped the connection",
+  ReadTimeout: "the host accepted the connection but sent no data before the timeout",
+  WriteTimeout: "the request could not be sent to the host",
+  PoolTimeout: "the fetch timed out waiting for a free connection",
+  TimeoutException: "the host did not respond before the timeout",
+  SSLError: "the TLS handshake failed, so the certificate could not be trusted",
+  TooManyRedirects: "the request was redirected too many times",
+  RemoteProtocolError: "the server closed the connection mid-response",
+  UnsupportedProtocol: "the URL scheme is not one the scanner fetches",
+  InvalidURL: "the URL could not be parsed",
+};
+
+const DEGRADED_NOTES: Record<string, string> = {
+  "ml.deterministic_fallback":
+    "ML pre-filter: no trained CatBoost model was applied, so the deterministic feature-weighted fallback scored this target.",
+  "llm.deterministic_fallback":
+    "Local LLM: the on-device model did not return a verdict, so the assessment is derived from deterministic rule evidence.",
+  "llm.timeout":
+    "Local LLM: the model did not answer within the scan deadline, so no model verdict was applied.",
+  "llm.error": "Local LLM: the model call failed for this scan.",
+  "visual.error": "Visual brand-clone comparison failed for this scan.",
+  "webpage.unavailable":
+    "Webpage layer: no page content was available, so nothing was parsed for credential forms or brand mismatches.",
+  "webpage.timeout": "Webpage layer: the page fetch exceeded its time budget.",
+  "webpage.blocked":
+    "Webpage layer: the page URL was refused by the outbound safety guard, so nothing was fetched.",
+  "webpage.error": "Webpage layer: the page analysis step failed.",
+  "webpage.fetch_blocked":
+    "Webpage layer: the page URL was refused by the outbound safety guard, so nothing was fetched.",
+  "webpage.truncated":
+    "Webpage layer: the page was larger than the size cap and was truncated before parsing.",
+  "domain.timeout": "Domain layer: the registration and DNS lookups exceeded their time budget.",
+  "domain.blocked": "Domain layer: the domain lookup was refused by the outbound safety guard.",
+  "domain.error": "Domain layer: the registration or DNS lookup failed.",
+  "url.error": "URL layer: the lexical URL analysis failed for this target.",
+  "email.error": "Email layer: the message analysis failed.",
+};
+
+const CODE_SHAPE = /^[a-z][a-z0-9_]*\.[a-z0-9_.:]+$/i;
+
+export function describeDegraded(code: string): string {
+  const direct = DEGRADED_NOTES[code];
+  if (direct) return direct;
+  if (code.startsWith("webpage.http_")) {
+    const status = code.slice("webpage.http_".length);
+    return `Webpage layer: the host answered HTTP ${status}, so no page was served (an error body is the server's own notice, not the page).`;
+  }
+  if (code.startsWith("webpage.fetch_failed")) {
+    const kind = code.includes(":") ? code.split(":")[1] : "";
+    const reason =
+      FETCH_FAILURE_REASONS[kind ?? ""] ?? "the page fetch failed before any content was read";
+    return `Webpage layer: ${reason}.`;
+  }
+  // Already a sentence (the built-in scanner reports prose, not codes).
+  if (!CODE_SHAPE.test(code)) return code;
+  return code.replace(/\./g, ": ").replace(/_/g, " ");
+}
+
 /** The response shape produced by the FastAPI backend. */
 interface BackendLayerEvidence {
   layer?: string;
@@ -46,6 +188,17 @@ interface BackendPrefilter {
   blended?: boolean;
   note?: string;
   layer_score?: number | null;
+  /** Class-weighted probability before any calibration was applied. */
+  raw_score?: number | null;
+  calibrated?: boolean;
+  /** Deployment-gate tier the deployed model cleared (`strict` | `triage`). */
+  gate_tier?: string | null;
+  gate_passed?: boolean | null;
+  split?: string | null;
+  trained_at?: string | null;
+  /** Operating point in probability space (0-1). */
+  decision_threshold?: number | null;
+  score_above_threshold?: boolean | null;
 }
 
 interface BackendSocEvent {
@@ -130,13 +283,38 @@ function toPrefilter(
   fallbackNote: string,
 ): AnalysisResult["prefilter"] {
   return {
-    model_trained: raw?.model_trained ?? false,
+    model_trained: raw?.model_trained ?? null,
     score: typeof raw?.score === "number" ? raw.score : null,
     method: asString(raw?.method, ""),
     weight: asNumber(raw?.weight, 0),
     blended: raw?.blended === true,
     layer_score: typeof raw?.layer_score === "number" ? raw.layer_score : null,
     note: raw?.note ?? fallbackNote,
+    ...provenanceOf(raw),
+  };
+}
+
+/** Model provenance, shared by the main result and the SOC-event copy of it. */
+function provenanceOf(raw: BackendPrefilter | null | undefined): {
+  raw_score: number | null;
+  calibrated: boolean;
+  gate_tier: string | null;
+  gate_passed: boolean | null;
+  split: string | null;
+  trained_at: string | null;
+  decision_threshold: number | null;
+  score_above_threshold: boolean | null;
+} {
+  return {
+    raw_score: typeof raw?.raw_score === "number" ? raw.raw_score : null,
+    calibrated: raw?.calibrated === true,
+    gate_tier: asString(raw?.gate_tier, "") || null,
+    gate_passed: typeof raw?.gate_passed === "boolean" ? raw.gate_passed : null,
+    split: asString(raw?.split, "") || null,
+    trained_at: asString(raw?.trained_at, "") || null,
+    decision_threshold: typeof raw?.decision_threshold === "number" ? raw.decision_threshold : null,
+    score_above_threshold:
+      typeof raw?.score_above_threshold === "boolean" ? raw.score_above_threshold : null,
   };
 }
 
@@ -178,6 +356,21 @@ export function normalizeAnalysisResult(raw: unknown): AnalysisResult {
     };
   }
 
+  // An *unavailable* layer with no indicators rendered as a bare "Unavailable"
+  // chip: the reader could not tell whether the feature was missing from the
+  // build or the page simply never answered. Carry the backend's own reason
+  // into the indicator list so it is visible in the report.
+  for (const name of LAYER_NAMES) {
+    const layer = layers[name];
+    if (layer.status !== "unavailable" || layer.indicators.length) continue;
+    const failure = layer.evidence["page_fetch_failed"];
+    layer.indicators = [
+      typeof failure === "string" && failure
+        ? `The page could not be read: ${failure}.`
+        : "No evidence was collected for this layer in this scan.",
+    ];
+  }
+
   // Visual evidence is attached to the webpage layer by the pipeline; surface
   // a best-effort view and never claim a match that was not produced.
   const pageEvidence = layers.webpage.evidence;
@@ -189,10 +382,15 @@ export function normalizeAnalysisResult(raw: unknown): AnalysisResult {
   // reason rather than a generic "not included" line, which hid a real
   // explanation and read as if the feature did not exist.
   const backendVisualNotes = asStringArray(pageEvidence["visual_indicators"]);
+  // The pipeline attaches a downscaled data URL of the screenshot it compared
+  // (see backend `/api/v1/analyze/*`); surface it so the report can show the
+  // evidence, not just the distance.
+  const screenshotThumbnail = asString(pageEvidence["screenshot_data_url"], "");
   const visual: AnalysisResult["visual"] = {
     status: hasVisual ? "ok" : "unavailable",
     visual_similarity_score: hasVisual ? visualScore : null,
     possible_brand: typeof possibleBrand === "string" ? possibleBrand : null,
+    screenshot_thumbnail: screenshotThumbnail || null,
     visual_indicators: hasVisual
       ? backendVisualNotes.length
         ? backendVisualNotes
@@ -215,13 +413,20 @@ export function normalizeAnalysisResult(raw: unknown): AnalysisResult {
       ? "No trained CatBoost model; the deterministic feature-weighted fallback was used."
       : "CatBoost prefilter result reported by the backend.");
   const prefilter: AnalysisResult["prefilter"] = {
-    model_trained: rawPrefilter?.model_trained ?? !fallbackOnly,
+    // Null, not a guess: if the backend omits the field, this client has not
+    // been told whether a trained model exists, and the `degraded` list is a
+    // report about this run, not about the deployed artifact.
+    model_trained: rawPrefilter?.model_trained ?? null,
     score: prefilterScore,
     method: asString(rawPrefilter?.method, ""),
     weight: prefilterWeight,
     blended: rawPrefilter?.blended === true,
     layer_score: typeof rawPrefilter?.layer_score === "number" ? rawPrefilter.layer_score : null,
     note: prefilterNote,
+    // Provenance of the deployed artifact. Without these a reader cannot tell
+    // whether a 42/100 score is over the model's own validated operating point
+    // (it is not) or whether the model ever cleared its deployment gate.
+    ...provenanceOf(rawPrefilter),
   };
 
   const rawLlm = r.llm_assessment ?? undefined;

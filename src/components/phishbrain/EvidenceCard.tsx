@@ -20,6 +20,9 @@ export function EvidenceCard({
 }) {
   const [open, setOpen] = useState(defaultOpen);
   const unavailable = layer.status !== "ok";
+  // Shown next to the header, so an unavailable layer explains *itself* instead
+  // of making the reader expand the card to discover why it is empty.
+  const unavailableReason = unavailable ? layer.indicators[0] : undefined;
 
   return (
     <section className="panel overflow-hidden">
@@ -47,18 +50,27 @@ export function EvidenceCard({
           className={cn("size-4 shrink-0 transition-transform", open && "rotate-180")}
         />
       </button>
+      {unavailable && unavailableReason ? (
+        <p className="border-t border-border px-4 py-2 text-xs text-muted-foreground">
+          {unavailableReason}
+        </p>
+      ) : null}
       {open ? (
         <div className="border-t border-border px-4 py-3">
           <ul className="space-y-1.5">
-            {layer.indicators.map((ind) => (
-              <li key={ind} className="flex gap-2 text-sm text-foreground/90">
-                <span
-                  aria-hidden="true"
-                  className="mt-1.5 size-1.5 shrink-0 rounded-full bg-primary"
-                />
-                <span>{ind}</span>
-              </li>
-            ))}
+            {layer.indicators
+              // The reason line is already visible above the divider; listing
+              // it twice reads like two separate findings.
+              .filter((ind) => !(unavailable && ind === unavailableReason))
+              .map((ind) => (
+                <li key={ind} className="flex gap-2 text-sm text-foreground/90">
+                  <span
+                    aria-hidden="true"
+                    className="mt-1.5 size-1.5 shrink-0 rounded-full bg-primary"
+                  />
+                  <span>{ind}</span>
+                </li>
+              ))}
           </ul>
           {Object.keys(layer.evidence).length ? (
             <details className="mt-3">

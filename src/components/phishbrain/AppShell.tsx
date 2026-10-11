@@ -113,8 +113,9 @@ export function AppShell({
             <p className="flex items-start gap-2 rounded-md border border-suspicious/30 bg-suspicious-soft p-2 text-[11px] leading-snug text-suspicious">
               <FlaskConical aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />
               <span>
-                <strong className="font-mono">DEMO MODE</strong> — results are generated locally
-                from synthetic samples and are labelled DEMO DATA.
+                <strong className="font-mono">DEMO FALLBACK ON</strong> — when the backend and the
+                built-in scanner both fail, the result is computed locally and labelled DEMO DATA.
+                Live scans still use the backend whenever it answers.
               </span>
             </p>
           ) : null}

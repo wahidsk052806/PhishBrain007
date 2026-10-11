@@ -6,6 +6,8 @@ import { AppShell } from "@/components/phishbrain/AppShell";
 import { AnalysisReport } from "@/components/phishbrain/AnalysisReport";
 import { api, BackendRejectedError, BackendUnavailableError } from "@/lib/phishbrain/api";
 import { analyzeDemo, DEMO_SAMPLES, saveDemoAnalysis } from "@/lib/phishbrain/demo";
+import { normalizeTargetInput } from "@/lib/phishbrain/normalize";
+import type { DemoSample } from "@/lib/phishbrain/demo";
 import { liveAnalyzeUrl, liveAnalyzeEmail } from "@/lib/phishbrain/scan.functions";
 import type { AnalysisResult } from "@/lib/phishbrain/types";
 import { usePhishbrainSettings } from "@/lib/phishbrain/usePhishbrainSettings";
@@ -48,23 +50,72 @@ function AnalyzePage() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [result, setResult] = useState<AnalysisResult | null>(null);
+  // Id of the demo sample currently loaded into the form, if any.
+  const [activeDemo, setActiveDemo] = useState<string | null>(null);
 
-  async function run(target: string, demoIndex?: number) {
+  // While a sample is loaded the form is a *demo* form: submitting it re-scores
+  // the synthetic sample offline instead of sending a hostname that cannot
+  // answer. The sample domains are unregistered or reserved, so a live scan
+  // could only ever come back as a DNS failure — which is exactly how the
+  // prompt-injection sample managed to look like a backend outage.
+  const loadedSample = activeDemo ? (DEMO_SAMPLES.find((s) => s.id === activeDemo) ?? null) : null;
+
+  function runDemoSample(sample: DemoSample) {
+    setBusy(true);
+    setError(null);
+    const demo = analyzeDemo(sample);
+    saveDemoAnalysis(demo);
+    setResult(demo);
+    setNotice(
+      `DEMO DATA — synthetic sample scored offline (${sample.label}). No request left this browser.`,
+    );
+    setBusy(false);
+  }
+
+  function loadSample(sample: DemoSample) {
+    setActiveDemo(sample.id);
+    if (sample.kind === "email") {
+      setMode("email");
+      setEmail({
+        from: sample.email?.from ?? "",
+        reply_to: sample.email?.reply_to ?? "",
+        display_name: sample.email?.display_name ?? "",
+        subject: sample.email?.subject ?? "",
+        body: sample.email?.body ?? "",
+      });
+    } else {
+      setUrl(sample.url);
+    }
+    runDemoSample(sample);
+  }
+
+  /** Editing any input detaches the loaded sample, so the next submit is live. */
+  function editEmail(patch: Partial<typeof email>) {
+    setEmail((prev) => ({ ...prev, ...patch }));
+    setActiveDemo(null);
+  }
+
+  async function run(rawTarget: string, options: { live?: boolean } = {}) {
+    // Normalise at the boundary: `hianime.to` is what people type, and sending
+    // it verbatim made the backend refuse the whole request for having an empty
+    // scheme. Both the backend and the built-in scanner receive the absolute
+    // URL, and the input box is updated so the operator can see what was
+    // actually scanned.
+    const target = normalizeTargetInput(rawTarget);
+    if (!target) return;
+
+    // A loaded demo sample stays offline unless a live scan is asked for
+    // explicitly.
+    if (!options.live && loadedSample && loadedSample.url === target) {
+      runDemoSample(loadedSample);
+      return;
+    }
+    if (target !== rawTarget.trim()) setUrl(target);
+
     setBusy(true);
     setError(null);
     setNotice(null);
     setResult(null);
-
-    // Synthetic demo samples are never contacted over the network.
-    if (demoIndex !== undefined) {
-      const sample = DEMO_SAMPLES[demoIndex];
-      const demo = analyzeDemo(sample ?? { url: target });
-      saveDemoAnalysis(demo);
-      setResult(demo);
-      setNotice("DEMO DATA — synthetic sample scored offline; no live request was made.");
-      setBusy(false);
-      return;
-    }
 
     // 1. Self-hosted FastAPI backend (full pipeline incl. Ollama + Playwright).
     try {
@@ -78,9 +129,14 @@ function AnalyzePage() {
       // backend's own reason instead of silently re-scanning without the ML
       // pre-filter, LLM reasoning or screenshot layers.
       if (err instanceof BackendRejectedError) {
+        // A guard refusal is an answer, not an outage. An unresolvable host is
+        // the common case and has a concrete, user-fixable cause, so say that
+        // instead of quoting the raw guard message.
+        const unresolved = /DNS resolution failed for ([^\s:]+)/i.exec(err.detail);
         setError(
-          `The backend refused this target: ${err.detail} (HTTP ${err.status}). ` +
-            "No result was produced, because the built-in scanner would have skipped the ML pre-filter, LLM and visual layers.",
+          unresolved
+            ? `This host does not resolve — the DNS lookup for ${unresolved[1]} failed, so nothing was fetched and no layer could be evaluated. Check the domain for typos: reserved documentation names such as example.org serve no subdomains, and unregistered domains answer nothing.`
+            : `The backend refused this target: ${err.detail} (HTTP ${err.status}). No report was produced — the request was stopped before any layer ran, and the built-in scanner is not used as a silent substitute because it cannot produce the ML pre-filter, LLM or visual evidence.`,
         );
         return;
       }
@@ -119,6 +175,13 @@ function AnalyzePage() {
   }
 
   async function runEmail() {
+    // A loaded email sample is synthetic and scored offline; its links are
+    // demonstrations, not targets to fetch.
+    if (loadedSample && loadedSample.kind === "email") {
+      runDemoSample(loadedSample);
+      return;
+    }
+
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -198,7 +261,7 @@ function AnalyzePage() {
               From address
               <input
                 value={email.from}
-                onChange={(e) => setEmail({ ...email, from: e.target.value })}
+                onChange={(e) => editEmail({ from: e.target.value })}
                 placeholder="billing@secure-paypa1.com"
                 className={field}
               />
@@ -207,7 +270,7 @@ function AnalyzePage() {
               Reply-To address
               <input
                 value={email.reply_to}
-                onChange={(e) => setEmail({ ...email, reply_to: e.target.value })}
+                onChange={(e) => editEmail({ reply_to: e.target.value })}
                 placeholder="recover@mail.ru"
                 className={field}
               />
@@ -216,7 +279,7 @@ function AnalyzePage() {
               Display name
               <input
                 value={email.display_name}
-                onChange={(e) => setEmail({ ...email, display_name: e.target.value })}
+                onChange={(e) => editEmail({ display_name: e.target.value })}
                 placeholder="PayPal Support"
                 className={field}
               />
@@ -225,7 +288,7 @@ function AnalyzePage() {
               Subject
               <input
                 value={email.subject}
-                onChange={(e) => setEmail({ ...email, subject: e.target.value })}
+                onChange={(e) => editEmail({ subject: e.target.value })}
                 placeholder="Your account will be suspended"
                 className={field}
               />
@@ -235,7 +298,7 @@ function AnalyzePage() {
             Message body (paste the full text — links inside are extracted and scanned live)
             <textarea
               value={email.body}
-              onChange={(e) => setEmail({ ...email, body: e.target.value })}
+              onChange={(e) => editEmail({ body: e.target.value })}
               rows={8}
               className={field}
             />
@@ -250,8 +313,18 @@ function AnalyzePage() {
             ) : (
               <Mail aria-hidden="true" className="size-4" />
             )}
-            Analyze email
+            {loadedSample?.kind === "email" ? "Re-run demo sample" : "Analyze email"}
           </button>
+          {loadedSample?.kind === "email" ? (
+            <p className="flex items-start gap-2 rounded-md border border-suspicious/40 bg-suspicious-soft px-3 py-2 text-xs text-suspicious">
+              <FlaskConical aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />
+              <span>
+                <strong className="font-mono">DEMO SAMPLE loaded</strong> — this message is
+                synthetic and scored offline, so its links are never fetched. Editing any field
+                detaches it and the next submit is a live scan.
+              </span>
+            </p>
+          ) : null}
         </form>
       ) : (
         <form
@@ -267,8 +340,13 @@ function AnalyzePage() {
           <input
             id="target-url"
             value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://example.com/login"
+            onChange={(e) => {
+              setUrl(e.target.value);
+              // Any edit detaches the loaded sample: the next submit is live.
+              if (activeDemo) setActiveDemo(null);
+            }}
+            onBlur={() => setUrl((value) => (value.trim() ? normalizeTargetInput(value) : value))}
+            placeholder="example.com/login or https://example.com/login"
             className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
           />
           <button
@@ -283,6 +361,26 @@ function AnalyzePage() {
             )}
             Analyze
           </button>
+          {loadedSample && loadedSample.kind !== "email" ? (
+            <p className="flex w-full flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-suspicious">
+              <FlaskConical aria-hidden="true" className="size-3.5 shrink-0" />
+              <span>
+                <strong className="font-mono">DEMO SAMPLE loaded</strong> — “{loadedSample.label}”
+                is synthetic and scored offline. Edit the URL above to detach it, or
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  const sample = loadedSample;
+                  setActiveDemo(null);
+                  void run(sample.url, { live: true });
+                }}
+                className="rounded-sm border border-suspicious/40 px-1.5 py-0.5 font-medium underline-offset-2 hover:underline"
+              >
+                scan this URL live instead
+              </button>
+            </p>
+          ) : null}
         </form>
       )}
 
@@ -294,14 +392,11 @@ function AnalyzePage() {
           Synthetic, safe-to-use examples. No live phishing URLs are contacted.
         </p>
         <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
-          {DEMO_SAMPLES.map((s, idx) => (
+          {DEMO_SAMPLES.map((s) => (
             <button
               key={s.id}
               type="button"
-              onClick={() => {
-                setUrl(s.url);
-                void run(s.url, idx);
-              }}
+              onClick={() => loadSample(s)}
               className="rounded-md border border-border bg-secondary/50 p-3 text-left transition-colors hover:bg-accent"
             >
               <span className="block text-sm font-medium">{s.label}</span>
@@ -331,7 +426,15 @@ function AnalyzePage() {
           <div className="mb-3 flex flex-wrap gap-2">
             <button
               type="button"
-              onClick={() => void run(result.target)}
+              onClick={() => {
+                // Re-run the way this result was produced: a loaded demo
+                // sample stays offline, everything else is re-scanned live.
+                if (loadedSample && loadedSample.url === result.target) {
+                  runDemoSample(loadedSample);
+                } else {
+                  void run(result.target);
+                }
+              }}
               className="rounded-md border border-border bg-secondary px-3 py-1.5 text-xs font-medium hover:bg-accent"
             >
               Rescan

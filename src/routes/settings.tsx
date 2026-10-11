@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { CheckCircle2, XCircle } from "lucide-react";
 import { AppShell } from "@/components/phishbrain/AppShell";
 import { api } from "@/lib/phishbrain/api";
@@ -30,6 +30,46 @@ function SettingsPage() {
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [visualPolicy, setVisualPolicy] = useState<{
+    retention_days: number;
+    auto_purge_enabled: boolean;
+  } | null>(null);
+  const [clearingVisual, setClearingVisual] = useState(false);
+  const [visualNotice, setVisualNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .visualEvidencePolicy()
+      .then((policy) => {
+        if (!cancelled) setVisualPolicy(policy);
+      })
+      .catch(() => {
+        if (!cancelled) setVisualPolicy(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function clearVisualEvidence() {
+    setClearingVisual(true);
+    setVisualNotice(null);
+    try {
+      const result = await api.clearVisualEvidence();
+      setVisualNotice(
+        result.cleared > 0
+          ? `Removed stored screenshots from ${result.cleared} ${result.cleared === 1 ? "analysis" : "analyses"}. The analyses themselves were kept.`
+          : "No stored screenshots to remove — nothing was being kept.",
+      );
+    } catch (err) {
+      setVisualNotice(
+        `Could not clear visual evidence: ${err instanceof Error ? err.message : "unknown error"}`,
+      );
+    } finally {
+      setClearingVisual(false);
+    }
+  }
 
   async function testConnection() {
     setTesting(true);
@@ -191,16 +231,44 @@ function SettingsPage() {
             <span className="font-mono">RETENTION_DAYS</span> on the backend. Nothing is sent to any
             third-party or proprietary AI service — all reasoning runs on a local Ollama model.
           </p>
-          <button
-            type="button"
-            onClick={() => {
-              clearDemoHistory();
-              setNotice("Locally stored demo analyses were removed from this browser.");
-            }}
-            className="mt-3 rounded-md border border-danger/40 bg-danger-soft px-3 py-1.5 text-sm text-danger hover:bg-danger/20"
-          >
-            Clear local demo data
-          </button>
+          <p className="mt-3 text-sm text-muted-foreground">
+            Screenshot evidence is purged on its own, shorter clock: the backend keeps a captured
+            page image for{" "}
+            <span className="font-mono">
+              {visualPolicy
+                ? `${visualPolicy.retention_days} day${visualPolicy.retention_days === 1 ? "" : "s"}`
+                : "the configured window"}
+            </span>{" "}
+            (<span className="font-mono">VISUAL_RETENTION_DAYS</span>
+            {visualPolicy && !visualPolicy.auto_purge_enabled
+              ? ", automatic sweep disabled"
+              : ", swept automatically"}
+            ), then drops the image while keeping the analysis record.
+          </p>
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void clearVisualEvidence()}
+              disabled={clearingVisual}
+              className="rounded-md border border-danger/40 bg-danger-soft px-3 py-1.5 text-sm text-danger hover:bg-danger/20 disabled:opacity-50"
+            >
+              {clearingVisual ? "Clearing screenshots…" : "Clear all visual evidence"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                clearDemoHistory();
+                setNotice("Locally stored demo analyses were removed from this browser.");
+              }}
+              className="rounded-md border border-border bg-secondary px-3 py-1.5 text-sm hover:bg-accent"
+            >
+              Clear local demo data
+            </button>
+          </div>
+          {visualNotice ? (
+            <p className="mt-2 text-xs text-muted-foreground">{visualNotice}</p>
+          ) : null}
           {notice ? <p className="mt-2 text-xs text-muted-foreground">{notice}</p> : null}
         </section>
       </div>

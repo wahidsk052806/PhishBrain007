@@ -1,6 +1,7 @@
 import { Download, FlaskConical, TriangleAlert } from "lucide-react";
 import type { AnalysisResult } from "@/lib/phishbrain/types";
 import { api } from "@/lib/phishbrain/api";
+import { describeDegraded } from "@/lib/phishbrain/normalize";
 import { EvidenceCard } from "./EvidenceCard";
 import { RiskBadge } from "./RiskBadge";
 import { ThreatScoreDial } from "./ThreatScoreDial";
@@ -44,11 +45,16 @@ function toCsv(r: AnalysisResult) {
 
 export function AnalysisReport({ result }: { result: AnalysisResult }) {
   const { prefilter } = result;
-  const prefilterStatus = !prefilter.model_trained
-    ? "No trained model"
-    : prefilter.blended
-      ? "Blended into score"
-      : "Available, not blended";
+  // `null` means no pre-filter ran for this result (the in-browser engines),
+  // which is not the same statement as "no trained model exists".
+  const prefilterStatus =
+    prefilter.model_trained === null
+      ? "Not consulted"
+      : prefilter.model_trained
+        ? prefilter.blended
+          ? "Blended into score"
+          : "Available, not blended"
+        : "No trained model";
   const blendedClass = prefilter.blended
     ? "border-suspicious/40 bg-suspicious-soft text-suspicious"
     : "border-border bg-muted/50 text-muted-foreground";
@@ -70,7 +76,9 @@ export function AnalysisReport({ result }: { result: AnalysisResult }) {
           {result.degraded.map((d) => (
             <li key={d} className="flex items-start gap-2">
               <TriangleAlert aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
-              <span>{d}</span>
+              {/* The code is kept in the tooltip so the sentence stays readable
+                  without losing traceability back to the raw pipeline signal. */}
+              <span title={d}>{describeDegraded(d)}</span>
             </li>
           ))}
         </ul>
@@ -166,6 +174,22 @@ export function AnalysisReport({ result }: { result: AnalysisResult }) {
         <h2 className="mb-2 text-sm font-semibold uppercase tracking-wider text-muted-foreground">
           Visual analysis
         </h2>
+        {result.visual.screenshot_thumbnail && (
+          <figure className="mb-3">
+            <img
+              src={result.visual.screenshot_thumbnail}
+              alt={
+                result.visual.possible_brand
+                  ? `Captured page screenshot, compared against ${result.visual.possible_brand}`
+                  : "Captured page screenshot used for the visual comparison"
+              }
+              className="max-h-64 w-auto rounded-md border border-border object-contain"
+            />
+            <figcaption className="mt-1 text-xs text-muted-foreground">
+              The captured screenshot this comparison was scored on.
+            </figcaption>
+          </figure>
+        )}
         {result.visual.status === "ok" ? (
           <div className="space-y-1 text-sm">
             <p>
@@ -313,7 +337,9 @@ export function AnalysisReport({ result }: { result: AnalysisResult }) {
         <p className="mt-1 text-xs text-muted-foreground">
           {result.prefilter.blended
             ? `The final score is weighted: ${Math.round((1 - result.prefilter.weight) * 100)}% deterministic layer evidence and ${Math.round(result.prefilter.weight * 100)}% model output.`
-            : "The pre-filter did not change the score for this input, so the score stands on the layer evidence alone."}
+            : result.prefilter.model_trained === null
+              ? "No pre-filter ran for this result, so the score stands on the layer evidence alone."
+              : "The pre-filter did not change the score for this input, so the score stands on the layer evidence alone."}
         </p>
       </section>
 

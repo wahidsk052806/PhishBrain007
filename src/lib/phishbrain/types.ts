@@ -22,6 +22,12 @@ export interface VisualEvidence {
   visual_similarity_score: number | null;
   possible_brand: string | null;
   visual_indicators: string[];
+  /**
+   * Downscaled data URL of the screenshot this verdict was scored on, when the
+   * backend is configured to return it (VITE/BACKEND `VISUAL_SCREENSHOT_MODE`).
+   * `pixels` gives a JPEG, `wireframe` an edge-only PNG. Null when off.
+   */
+  screenshot_thumbnail?: string | null;
 }
 
 export interface LLMAssessment {
@@ -61,9 +67,20 @@ export interface SocEvent {
  * (or no URL was available), in which case `score` contributed nothing.
  */
 export interface PrefilterEvidence {
-  model_trained: boolean;
+  /**
+   * Whether a trained CatBoost model exists **and was consulted** for this
+   * result. Null means the question was never asked — the in-browser engines
+   * (demo and built-in live scanner) never call the backend's prefilter, so
+   * they have nothing to say about the deployed artifact. Reporting `false`
+   * there claimed "no trained model" on a deployment that has one.
+   */
+  model_trained: boolean | null;
   score: number | null;
-  /** `catboost` when a trained model scored it, `deterministic_fallback` otherwise. */
+  /**
+   * `catboost` when a trained model scored it, `deterministic_fallback` when the
+   * backend fell back to its rule-based scoring, `not_consulted` when no
+   * prefilter ran at all (in-browser engines).
+   */
   method: string;
   /** Share of the base score the prefilter carried (0 when not blended). */
   weight: number;
@@ -71,6 +88,26 @@ export interface PrefilterEvidence {
   note: string;
   /** Multi-layer score before the prefilter was folded in. */
   layer_score: number | null;
+  /** The model's own class-weighted probability, before calibration. */
+  raw_score: number | null;
+  calibrated: boolean;
+  /**
+   * Which deployment-gate tier the deployed model cleared, if it declares one
+   * (`strict` = fit to decide alone, `triage` = fit to be one disclosed signal
+   * among several). Null when the metadata predates the tiering.
+   */
+  gate_tier: string | null;
+  gate_passed: boolean | null;
+  /** The split the model's metrics were measured on. */
+  split: string | null;
+  trained_at: string | null;
+  /**
+   * The operating point the model was validated at, in probability space. A
+   * score below it is not "suspicious" however large the number looks, which is
+   * what `score_above_threshold` reports directly.
+   */
+  decision_threshold: number | null;
+  score_above_threshold: boolean | null;
 }
 
 export interface AnalysisResult {

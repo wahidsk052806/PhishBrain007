@@ -473,6 +473,12 @@ export interface DemoSample {
   label: string;
   description: string;
   url: string;
+  /**
+   * Which input the sample belongs to. An email sample is scored by the email
+   * layer and must never be handed to a live URL scan: its `url` is a display
+   * device (a fake message link), not a fetchable target.
+   */
+  kind?: "url" | "email";
   domain?: DemoDomainContext;
   page?: DemoPageContext;
   email?: DemoEmailContext;
@@ -528,7 +534,8 @@ export const DEMO_SAMPLES: DemoSample[] = [
     label: "Prompt-injection email",
     description:
       "Phishing email whose body tries to hijack the LLM. The text is handled strictly as data.",
-    url: "https://mail.example.org/message/482",
+    kind: "email",
+    url: "billing@secure-notice-mail.top",
     email: {
       from: "billing@secure-notice-mail.top",
       reply_to: "collect@another-domain.tk",
@@ -595,9 +602,22 @@ export function analyzeDemo(
 ): AnalysisResult {
   const live = options.live === true;
   const started = performance.now();
+  // An email-only target has no URL to score. Treating it as one invented
+  // evidence ("connection does not use HTTPS" on a mail address) and produced a
+  // target that looked fetchable when it was not.
+  const isUrlTarget = /^https?:\/\//i.test(sample.url);
   const f = extractUrlFeatures(sample.url);
+  const emailDomain = sample.email?.from?.split("@")[1]?.toLowerCase() ?? null;
+  const targetDomain = isUrlTarget ? f.hostname : (emailDomain ?? f.hostname);
   const layers: Record<LayerName, LayerEvidence> = {
-    url: scoreUrlLayer(f),
+    url: isUrlTarget
+      ? scoreUrlLayer(f)
+      : {
+          risk: 0,
+          indicators: ["Target is an email address, not a URL — URL layer not applicable"],
+          evidence: {},
+          status: "not_applicable",
+        },
     domain: scoreDomainLayer(f, sample.domain ?? {}, live),
     webpage: scorePageLayer(sample.page, f),
     email: scoreEmailLayer(sample.email),
@@ -623,8 +643,15 @@ export function analyzeDemo(
     .filter((k) => layers[k].status === "ok" && layers[k].risk > 0)
     .flatMap((k) => layers[k].indicators);
 
-  const recommended =
-    risk === "HIGH_RISK"
+  // Advice has to match the target: "close the tab" is meaningless for a
+  // message, and "do not reply" is meaningless for a page.
+  const recommended = !isUrlTarget
+    ? risk === "HIGH_RISK"
+      ? "Do not click links, open attachments or reply. Report the message to your mail provider and delete it."
+      : risk === "SUSPICIOUS"
+        ? "Treat this message as untrusted: confirm the sender through a separate, known-good channel before acting on it."
+        : "No action required. Continue to apply normal caution to unexpected mail."
+    : risk === "HIGH_RISK"
       ? "Do not enter credentials or financial information on this page. Close the tab and reach the service through a known-good bookmark."
       : risk === "SUSPICIOUS"
         ? "Review the evidence below before continuing. Do not submit credentials unless you can independently verify the domain."
@@ -637,7 +664,7 @@ export function analyzeDemo(
     timestamp: now,
     analysis_id: analysisId,
     url: sample.url,
-    domain: f.hostname,
+    domain: targetDomain,
     threat_score: score,
     risk_level: risk,
     confidence: 0,
@@ -658,7 +685,7 @@ export function analyzeDemo(
     analysis_id: analysisId,
     created_at: now,
     target: sample.url,
-    domain: f.hostname,
+    domain: targetDomain,
     threat_score: score,
     risk_level: risk,
     confidence,
@@ -684,18 +711,31 @@ export function analyzeDemo(
           ],
         },
     prefilter: {
-      model_trained: false,
+      // Null, not false: neither in-browser engine calls the backend's
+      // prefilter, so this result cannot say whether a trained model exists.
+      // `false` used to render as "No trained model" on deployments that have
+      // one — a claim this engine is not entitled to make.
+      model_trained: null,
       score: null,
-      method: live ? "not_consulted" : "deterministic_fallback",
+      method: "not_consulted",
       weight: 0,
       blended: false,
       layer_score: null,
-      // Do not claim a model was never trained: one may well be deployed in the
-      // backend. The honest statement is that *this* result was not scored by it,
+      // The honest statement is that *this* result was not scored by the model,
       // because the in-browser engines never call the backend's prefilter.
       note: live
         ? "Not applied: this result came from the built-in scanner, which does not run the backend's CatBoost pre-filter."
         : "Not applied: demo mode runs entirely in the browser and never consults the backend's CatBoost pre-filter.",
+      // Null, not false/unknown-as-fact: no artifact was consulted here, so this
+      // result has nothing to say about the deployed model's provenance.
+      raw_score: null,
+      calibrated: false,
+      gate_tier: null,
+      gate_passed: null,
+      split: null,
+      trained_at: null,
+      decision_threshold: null,
+      score_above_threshold: null,
     },
     llm_assessment: {
       status: "unavailable",
