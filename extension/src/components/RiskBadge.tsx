@@ -2,7 +2,11 @@ import type { RiskLevel } from "../types/analysis";
 
 const CONFIG: Record<RiskLevel, { label: string; icon: string; classes: string }> = {
   SAFE: { label: "Safe", icon: "✓", classes: "bg-emerald-950 text-emerald-300 border-emerald-700" },
-  SUSPICIOUS: { label: "Suspicious", icon: "⚠", classes: "bg-amber-950 text-amber-300 border-amber-700" },
+  SUSPICIOUS: {
+    label: "Suspicious",
+    icon: "⚠",
+    classes: "bg-amber-950 text-amber-300 border-amber-700",
+  },
   HIGH_RISK: { label: "High Risk", icon: "✕", classes: "bg-red-950 text-red-300 border-red-700" },
 };
 

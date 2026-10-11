@@ -35,7 +35,9 @@ function isPromiseNative(): boolean {
 }
 
 export const storage = {
-  async get<T = Record<string, unknown>>(keys: string | string[] | Record<string, unknown> | null): Promise<T> {
+  async get<T = Record<string, unknown>>(
+    keys: string | string[] | Record<string, unknown> | null,
+  ): Promise<T> {
     if (isPromiseNative()) {
       return (runtime.storage.local.get as any)(keys) as Promise<T>;
     }
@@ -54,7 +56,9 @@ export const storage = {
     return promisify<void>((cb) => runtime.storage.local.remove(keys as any, cb as any));
   },
   onChanged: {
-    addListener(cb: (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => void) {
+    addListener(
+      cb: (changes: Record<string, chrome.storage.StorageChange>, areaName: string) => void,
+    ) {
       runtime.storage.onChanged.addListener(cb as any);
     },
   },
@@ -87,12 +91,14 @@ export const tabsApi = {
   },
   async captureVisibleTab(
     windowId?: number,
-    options: { format?: "png" | "jpeg"; quality?: number } = { format: "png" }
+    options: { format?: "png" | "jpeg"; quality?: number } = { format: "png" },
   ): Promise<string> {
     if (isPromiseNative()) {
       return (runtime.tabs.captureVisibleTab as any)(windowId, options) as Promise<string>;
     }
-    return promisify<string>((cb) => runtime.tabs.captureVisibleTab(windowId as any, options as any, cb as any));
+    return promisify<string>((cb) =>
+      runtime.tabs.captureVisibleTab(windowId as any, options as any, cb as any),
+    );
   },
   onActivated: {
     addListener(cb: (activeInfo: chrome.tabs.TabActiveInfo) => void) {
@@ -101,7 +107,7 @@ export const tabsApi = {
   },
   onUpdated: {
     addListener(
-      cb: (tabId: number, changeInfo: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab) => void
+      cb: (tabId: number, changeInfo: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab) => void,
     ) {
       runtime.tabs.onUpdated.addListener(cb as any);
     },
@@ -122,9 +128,24 @@ export const runtimeApi = {
   },
   onMessage: {
     addListener(
-      cb: (message: any, sender: chrome.runtime.MessageSender, sendResponse: (response?: any) => void) => boolean | void
+      cb: (
+        message: any,
+        sender: chrome.runtime.MessageSender,
+        sendResponse: (response?: any) => void,
+      ) => boolean | void,
     ) {
       runtime.runtime.onMessage.addListener(cb as any);
+    },
+  },
+  onStartup: {
+    /** Browser launch — the natural point to enforce the retention policy. */
+    addListener(cb: () => void) {
+      runtime.runtime.onStartup?.addListener(cb as any);
+    },
+  },
+  onInstalled: {
+    addListener(cb: () => void) {
+      runtime.runtime.onInstalled?.addListener(cb as any);
     },
   },
   getURL(path: string): string {
@@ -156,8 +177,33 @@ export const actionApi = {
   },
 };
 
+export const notificationsApi = {
+  /**
+   * Desktop alert for high-risk detections. Firefox exposes the same
+   * `notifications` surface through the `browser` namespace, so the wrapper
+   * keeps the extension free of engine-specific calls.
+   */
+  create(
+    options: { type: string; iconUrl?: string; title: string; message: string } & Record<
+      string,
+      unknown
+    >,
+  ): Promise<string> {
+    const api = (runtime as any).notifications;
+    if (!api) return Promise.resolve("");
+    if (isPromiseNative()) {
+      return api.create("", options) as Promise<string>;
+    }
+    return new Promise<string>((resolve) => {
+      api.create("", options, (id: string) => resolve(id ?? ""));
+    });
+  },
+};
+
 export const scriptingApi = {
-  async executeScript<T = unknown>(injection: chrome.scripting.ScriptInjection<any[], T>): Promise<chrome.scripting.InjectionResult<T>[]> {
+  async executeScript<T = unknown>(
+    injection: chrome.scripting.ScriptInjection<any[], T>,
+  ): Promise<chrome.scripting.InjectionResult<T>[]> {
     if (isPromiseNative()) {
       return (runtime as any).scripting.executeScript(injection);
     }

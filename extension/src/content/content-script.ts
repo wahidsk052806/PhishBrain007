@@ -84,7 +84,7 @@ function renderBanner(result: AnalysisResult, dashboardUrl: string): void {
         const url = `${dashboardUrl.replace(/\/$/, "")}/?analysis_id=${encodeURIComponent(result.analysis_id)}`;
         void runtimeApi.sendMessage({ type: "OPEN_DASHBOARD", url });
       },
-    })
+    }),
   );
 }
 

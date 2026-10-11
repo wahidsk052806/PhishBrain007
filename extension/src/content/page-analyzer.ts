@@ -83,7 +83,10 @@ function classifyInput(el: HTMLInputElement): string {
   return type;
 }
 
-export function summarizePage(doc: Document = document, location: Location = window.location): PageSummary {
+export function summarizePage(
+  doc: Document = document,
+  location: Location = window.location,
+): PageSummary {
   const url = location.href;
   const title = sanitizeText(doc.title || "", 200);
 
@@ -93,7 +96,9 @@ export function summarizePage(doc: Document = document, location: Location = win
     const type = classifyInput(input);
     fieldTypeCounts.set(type, (fieldTypeCounts.get(type) ?? 0) + 1);
   }
-  const fieldTypes: FormFieldSummary[] = Array.from(fieldTypeCounts.entries()).map(([type, count]) => ({ type, count }));
+  const fieldTypes: FormFieldSummary[] = Array.from(fieldTypeCounts.entries()).map(
+    ([type, count]) => ({ type, count }),
+  );
   const hasPasswordField = fieldTypeCounts.has("password");
   const hasOtpField = fieldTypeCounts.has("otp");
   const hasCardField = fieldTypeCounts.has("card");
@@ -116,7 +121,10 @@ export function summarizePage(doc: Document = document, location: Location = win
   const metaRefresh = doc.querySelector('meta[http-equiv="refresh" i]');
   const hasMetaRefresh = !!metaRefresh;
 
-  const anchors = Array.from(doc.querySelectorAll("a[href]")).slice(0, MAX_LINKS) as HTMLAnchorElement[];
+  const anchors = Array.from(doc.querySelectorAll("a[href]")).slice(
+    0,
+    MAX_LINKS,
+  ) as HTMLAnchorElement[];
   const linkMismatches: LinkMismatch[] = [];
   for (const a of anchors) {
     if (linkMismatches.length >= MAX_MISMATCHES) break;
@@ -124,10 +132,20 @@ export function summarizePage(doc: Document = document, location: Location = win
     const visibleText = sanitizeText(a.textContent || "", 100);
     if (!hrefHost || !visibleText) continue;
     // Detect text that looks like a URL/domain but doesn't match the href host
-    const looksLikeUrl = /\.[a-z]{2,}/i.test(visibleText) && /^[\w.-]+\.[a-z]{2,}/i.test(visibleText.replace(/^https?:\/\//i, ""));
+    const looksLikeUrl =
+      /\.[a-z]{2,}/i.test(visibleText) &&
+      /^[\w.-]+\.[a-z]{2,}/i.test(visibleText.replace(/^https?:\/\//i, ""));
     if (looksLikeUrl) {
-      const textHost = visibleText.replace(/^https?:\/\//i, "").split(/[/\s]/)[0].toLowerCase();
-      if (textHost && textHost !== hrefHost && !hrefHost.endsWith(textHost) && !textHost.endsWith(hrefHost)) {
+      const textHost = visibleText
+        .replace(/^https?:\/\//i, "")
+        .split(/[/\s]/)[0]
+        .toLowerCase();
+      if (
+        textHost &&
+        textHost !== hrefHost &&
+        !hrefHost.endsWith(textHost) &&
+        !textHost.endsWith(hrefHost)
+      ) {
         linkMismatches.push({ hrefHost, visibleText });
       }
     }
@@ -141,7 +159,10 @@ export function summarizePage(doc: Document = document, location: Location = win
 
   const bodyText = doc.body ? doc.body.innerText || doc.body.textContent || "" : "";
   const lowerBody = bodyText.toLowerCase();
-  const brandMentions = KNOWN_BRANDS.filter((brand) => lowerBody.includes(brand)).slice(0, MAX_BRAND_MENTIONS);
+  const brandMentions = KNOWN_BRANDS.filter((brand) => lowerBody.includes(brand)).slice(
+    0,
+    MAX_BRAND_MENTIONS,
+  );
 
   const sanitizedText = sanitizeText(bodyText, MAX_TEXT_LENGTH);
 

@@ -57,9 +57,15 @@ function parseGmail(doc: Document): Partial<ParsedEmail> {
 }
 
 function parseOutlook(doc: Document): Partial<ParsedEmail> {
-  const senderEl = doc.querySelector('[data-testid="SenderCard"] span, span.OZZZK') as HTMLElement | null;
+  const senderEl = doc.querySelector(
+    '[data-testid="SenderCard"] span, span.OZZZK',
+  ) as HTMLElement | null;
   const senderText = senderEl?.textContent?.trim() ?? "";
-  const sender = extractEmailFromText(senderText) ?? (senderEl?.getAttribute("title") ? extractEmailFromText(senderEl.getAttribute("title") || "") : null);
+  const sender =
+    extractEmailFromText(senderText) ??
+    (senderEl?.getAttribute("title")
+      ? extractEmailFromText(senderEl.getAttribute("title") || "")
+      : null);
   const displayName = senderText.replace(/<.*>/, "").trim() || null;
 
   const subjectEl = doc.querySelector('[data-testid="SubjectLine"], .allowTextSelection h1');
@@ -77,7 +83,10 @@ function parseOutlook(doc: Document): Partial<ParsedEmail> {
   return { sender, displayName, subject, bodyText, links, replyTo: null };
 }
 
-export function parseEmail(doc: Document = document, location: Location = window.location): ParsedEmail | null {
+export function parseEmail(
+  doc: Document = document,
+  location: Location = window.location,
+): ParsedEmail | null {
   const provider = detectProvider(location.hostname);
   if (provider === "unknown") return null;
 

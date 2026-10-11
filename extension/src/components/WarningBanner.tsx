@@ -12,7 +12,13 @@ export interface WarningBannerProps {
   onViewDetails: () => void;
 }
 
-export default function WarningBanner({ result, onDismiss, onGoBack, onProceedAnyway, onViewDetails }: WarningBannerProps) {
+export default function WarningBanner({
+  result,
+  onDismiss,
+  onGoBack,
+  onProceedAnyway,
+  onViewDetails,
+}: WarningBannerProps) {
   const headingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
@@ -30,7 +36,12 @@ export default function WarningBanner({ result, onDismiss, onGoBack, onProceedAn
     >
       <div className="flex flex-1 flex-col gap-2">
         <div className="flex flex-wrap items-center gap-3">
-          <h2 ref={headingRef} tabIndex={-1} className="text-sm font-bold outline-none" aria-label={`PhishBrain warning: ${label} page detected`}>
+          <h2
+            ref={headingRef}
+            tabIndex={-1}
+            className="text-sm font-bold outline-none"
+            aria-label={`PhishBrain warning: ${label} page detected`}
+          >
             PhishBrain: {label} page detected
           </h2>
           <RiskBadge level={result.risk_level} />
@@ -39,7 +50,10 @@ export default function WarningBanner({ result, onDismiss, onGoBack, onProceedAn
           <ThreatScore score={result.threat_score} />
         </div>
         {topIndicators.length > 0 && (
-          <ul className="list-disc space-y-0.5 pl-4 text-xs text-slate-300" aria-label="Top indicators">
+          <ul
+            className="list-disc space-y-0.5 pl-4 text-xs text-slate-300"
+            aria-label="Top indicators"
+          >
             {topIndicators.map((ind, i) => (
               <li key={i}>{ind}</li>
             ))}

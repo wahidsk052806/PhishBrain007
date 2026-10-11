@@ -105,9 +105,7 @@ export function normalizeServerResult(raw: ServerAnalysisResult): AnalysisResult
     webpage: emptyLayer(),
     email: emptyLayer(),
   };
-  const evidence: LayerEvidenceWire[] = Array.isArray(raw.layer_evidence)
-    ? raw.layer_evidence
-    : [];
+  const evidence: LayerEvidenceWire[] = Array.isArray(raw.layer_evidence) ? raw.layer_evidence : [];
   for (const entry of evidence) {
     const key = entry.layer as keyof LayersBreakdown;
     if (!(key in layers)) continue;
@@ -115,6 +113,9 @@ export function normalizeServerResult(raw: ServerAnalysisResult): AnalysisResult
       risk: entry.unavailable ? 0 : Number(entry.risk_score) || 0,
       indicators: Array.isArray(entry.indicators) ? entry.indicators : [],
       evidence: { ...(entry.details ?? {}) },
+      raw_risk: Number(entry.risk_score) || 0,
+      unavailable: entry.unavailable ?? false,
+      notes: entry.notes ?? null,
     };
   }
 
@@ -125,7 +126,7 @@ async function request<T>(
   path: string,
   init: RequestInit,
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
-  baseUrlOverride?: string
+  baseUrlOverride?: string,
 ): Promise<T> {
   const baseUrl = baseUrlOverride ?? (await getBackendBaseUrl());
   const controller = new AbortController();
@@ -146,7 +147,10 @@ async function request<T>(
     if (err instanceof DOMException && err.name === "AbortError") {
       throw new ApiError("TIMEOUT", "Request to PhishBrain backend timed out.");
     }
-    throw new ApiError("BACKEND_UNAVAILABLE", "Backend unavailable. Check that PhishBrain backend is running and configured correctly.");
+    throw new ApiError(
+      "BACKEND_UNAVAILABLE",
+      "Backend unavailable. Check that PhishBrain backend is running and configured correctly.",
+    );
   }
   clearTimeout(timer);
 
@@ -157,7 +161,11 @@ async function request<T>(
     } catch {
       /* ignore */
     }
-    throw new ApiError("HTTP_ERROR", `Backend returned ${response.status}: ${bodyText || response.statusText}`, response.status);
+    throw new ApiError(
+      "HTTP_ERROR",
+      `Backend returned ${response.status}: ${bodyText || response.statusText}`,
+      response.status,
+    );
   }
 
   try {
@@ -167,7 +175,10 @@ async function request<T>(
   }
 }
 
-export function analyzeUrl(payload: UrlAnalyzeRequest, baseUrlOverride?: string): Promise<AnalysisResult> {
+export function analyzeUrl(
+  payload: UrlAnalyzeRequest,
+  baseUrlOverride?: string,
+): Promise<AnalysisResult> {
   return request<ServerAnalysisResult>(
     "/api/v1/analyze/url",
     {
@@ -179,7 +190,10 @@ export function analyzeUrl(payload: UrlAnalyzeRequest, baseUrlOverride?: string)
   ).then(normalizeServerResult);
 }
 
-export function analyzePage(payload: PageAnalyzeRequest, baseUrlOverride?: string): Promise<AnalysisResult> {
+export function analyzePage(
+  payload: PageAnalyzeRequest,
+  baseUrlOverride?: string,
+): Promise<AnalysisResult> {
   return request<ServerAnalysisResult>(
     "/api/v1/analyze/page",
     {
@@ -195,7 +209,10 @@ export function analyzePage(payload: PageAnalyzeRequest, baseUrlOverride?: strin
   ).then(normalizeServerResult);
 }
 
-export function analyzeEmail(payload: EmailAnalyzeRequest, baseUrlOverride?: string): Promise<AnalysisResult> {
+export function analyzeEmail(
+  payload: EmailAnalyzeRequest,
+  baseUrlOverride?: string,
+): Promise<AnalysisResult> {
   // The backend's EmailAnalyzeRequest expects `body` (`body_text` is ignored).
   return request<ServerAnalysisResult>(
     "/api/v1/analyze/email",
@@ -268,7 +285,11 @@ export async function analyzeEmailCloud(
   }
   clearTimeout(timer);
   if (!response.ok) {
-    throw new ApiError("HTTP_ERROR", `Live email scan returned ${response.status}`, response.status);
+    throw new ApiError(
+      "HTTP_ERROR",
+      `Live email scan returned ${response.status}`,
+      response.status,
+    );
   }
   try {
     return normalizeServerResult((await response.json()) as ServerAnalysisResult);
@@ -277,7 +298,10 @@ export async function analyzeEmailCloud(
   }
 }
 
-export async function analyzeUrlCloud(payload: UrlAnalyzeRequest, cloudUrl?: string): Promise<AnalysisResult> {
+export async function analyzeUrlCloud(
+  payload: UrlAnalyzeRequest,
+  cloudUrl?: string,
+): Promise<AnalysisResult> {
   const endpoint = (cloudUrl || DEFAULT_CLOUD_SCAN_URL).replace(/\/$/, "");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);

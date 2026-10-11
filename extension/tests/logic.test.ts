@@ -45,7 +45,9 @@ describe("shouldScanUrl", () => {
   });
 
   it("returns false when domain is allowlisted", () => {
-    expect(shouldScanUrl("https://sub.example.com/path", { autoScan: true, allowlist: ["example.com"] })).toBe(false);
+    expect(
+      shouldScanUrl("https://sub.example.com/path", { autoScan: true, allowlist: ["example.com"] }),
+    ).toBe(false);
   });
 
   it("returns true for a normal http(s) url not allowlisted", () => {
@@ -81,26 +83,38 @@ describe("badgeForUnavailable", () => {
 
 describe("shouldShowBanner", () => {
   it("never shows banner in silent mode", () => {
-    expect(shouldShowBanner(makeResult({ risk_level: "HIGH_RISK", threat_score: 99 }), { bannerMode: "silent", riskThreshold: 10 })).toBe(
-      false
-    );
+    expect(
+      shouldShowBanner(makeResult({ risk_level: "HIGH_RISK", threat_score: 99 }), {
+        bannerMode: "silent",
+        riskThreshold: 10,
+      }),
+    ).toBe(false);
   });
 
   it("never shows banner for SAFE results", () => {
-    expect(shouldShowBanner(makeResult({ risk_level: "SAFE", threat_score: 90 }), { bannerMode: "banner", riskThreshold: 10 })).toBe(
-      false
-    );
+    expect(
+      shouldShowBanner(makeResult({ risk_level: "SAFE", threat_score: 90 }), {
+        bannerMode: "banner",
+        riskThreshold: 10,
+      }),
+    ).toBe(false);
   });
 
   it("shows banner when score meets threshold", () => {
     expect(
-      shouldShowBanner(makeResult({ risk_level: "SUSPICIOUS", threat_score: 60 }), { bannerMode: "banner", riskThreshold: 50 })
+      shouldShowBanner(makeResult({ risk_level: "SUSPICIOUS", threat_score: 60 }), {
+        bannerMode: "banner",
+        riskThreshold: 50,
+      }),
     ).toBe(true);
   });
 
   it("does not show banner when score is below threshold", () => {
     expect(
-      shouldShowBanner(makeResult({ risk_level: "SUSPICIOUS", threat_score: 40 }), { bannerMode: "banner", riskThreshold: 50 })
+      shouldShowBanner(makeResult({ risk_level: "SUSPICIOUS", threat_score: 40 }), {
+        bannerMode: "banner",
+        riskThreshold: 50,
+      }),
     ).toBe(false);
   });
 });
@@ -133,7 +147,10 @@ describe("parseIncomingMessage", () => {
   });
 
   it("parses GET_RESULT", () => {
-    expect(parseIncomingMessage({ type: "GET_RESULT", tabId: 1 })).toEqual({ type: "GET_RESULT", tabId: 1 });
+    expect(parseIncomingMessage({ type: "GET_RESULT", tabId: 1 })).toEqual({
+      type: "GET_RESULT",
+      tabId: 1,
+    });
   });
 
   it("parses RESCAN", () => {
@@ -152,7 +169,14 @@ describe("parseIncomingMessage", () => {
   });
 
   it("parses PAGE_SUMMARY", () => {
-    expect(parseIncomingMessage({ type: "PAGE_SUMMARY", tabId: 1, url: "https://a.com", summary: { title: "x" } })).toEqual({
+    expect(
+      parseIncomingMessage({
+        type: "PAGE_SUMMARY",
+        tabId: 1,
+        url: "https://a.com",
+        summary: { title: "x" },
+      }),
+    ).toEqual({
       type: "PAGE_SUMMARY",
       tabId: 1,
       url: "https://a.com",
@@ -161,7 +185,12 @@ describe("parseIncomingMessage", () => {
   });
 
   it("parses EMAIL_SUMMARY", () => {
-    const msg = { type: "EMAIL_SUMMARY", tabId: 1, url: "https://mail.google.com", email: { sender: "a@b.com" } };
+    const msg = {
+      type: "EMAIL_SUMMARY",
+      tabId: 1,
+      url: "https://mail.google.com",
+      email: { sender: "a@b.com" },
+    };
     expect(parseIncomingMessage(msg)).toEqual(msg);
   });
 

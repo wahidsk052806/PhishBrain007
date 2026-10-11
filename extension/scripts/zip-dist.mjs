@@ -114,6 +114,10 @@ function addEntry(name, data) {
 for (const name of names.sort()) {
   if (flavour === "firefox" && name === "manifest.firefox.json") continue; // added below as manifest.json
   if (name === "manifest.json" && flavour === "firefox") continue;
+  // The Chrome package must not ship the Firefox manifest either. Two
+  // manifests in one archive is ambiguous for a store reviewer and for anyone
+  // unzipping the package to see which one is live.
+  if (flavour === "chrome" && name === "manifest.firefox.json") continue;
   const data = readFileSync(join(DIST, name.replace(/\//g, "\\")));
   addEntry(name, data);
 }

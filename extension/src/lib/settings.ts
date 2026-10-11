@@ -7,6 +7,13 @@ import {
 } from "../services/api";
 
 export type BannerMode = "banner" | "silent";
+/**
+ * How the stored screenshot thumbnail is rendered. `pixels` is the real
+ * downscaled image; `wireframe` keeps the layout as black-on-white edges and
+ * drops colour and legible text, so evidence can be shown without saving a
+ * readable copy of the page.
+ */
+export type ScreenshotPrivacy = "pixels" | "wireframe";
 
 export interface Settings {
   backendUrl: string;
@@ -23,6 +30,13 @@ export interface Settings {
   alertsEnabled: boolean;
   /** Opt-in: capture the visible tab and send it for visual brand-clone analysis. */
   captureScreenshots: boolean;
+  /** Rendering of the stored thumbnail: real pixels, or an edge-only wireframe. */
+  screenshotPrivacy: ScreenshotPrivacy;
+  /**
+   * Days a stored screenshot is kept before the automatic sweep strips it.
+   * 0 means "store none": every sweep removes screenshots immediately.
+   */
+  visualRetentionDays: number;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -38,6 +52,8 @@ export const DEFAULT_SETTINGS: Settings = {
   alertWebhookUrl: "",
   alertsEnabled: false,
   captureScreenshots: false,
+  screenshotPrivacy: "pixels",
+  visualRetentionDays: 7,
 };
 
 export async function getSettings(): Promise<Settings> {
@@ -54,6 +70,8 @@ export async function getSettings(): Promise<Settings> {
     "alertWebhookUrl",
     "alertsEnabled",
     "captureScreenshots",
+    "screenshotPrivacy",
+    "visualRetentionDays",
   ]);
   return { ...DEFAULT_SETTINGS, ...stored };
 }

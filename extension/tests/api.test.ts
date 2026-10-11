@@ -25,7 +25,9 @@ describe("api error handling", () => {
       throw new TypeError("Failed to fetch");
     }) as unknown as typeof fetch;
 
-    await expect(analyzeUrl({ url: "https://example.com" }, "http://127.0.0.1:9999")).rejects.toMatchObject({
+    await expect(
+      analyzeUrl({ url: "https://example.com" }, "http://127.0.0.1:9999"),
+    ).rejects.toMatchObject({
       code: "BACKEND_UNAVAILABLE",
     });
   });
@@ -35,7 +37,9 @@ describe("api error handling", () => {
       throw new DOMException("Aborted", "AbortError");
     }) as unknown as typeof fetch;
 
-    await expect(analyzeUrl({ url: "https://example.com" }, "http://127.0.0.1:9999")).rejects.toMatchObject({
+    await expect(
+      analyzeUrl({ url: "https://example.com" }, "http://127.0.0.1:9999"),
+    ).rejects.toMatchObject({
       code: "TIMEOUT",
     });
   });
@@ -43,15 +47,18 @@ describe("api error handling", () => {
   it("throws HTTP_ERROR on non-ok responses", async () => {
     global.fetch = vi.fn(
       async () =>
-        new Response("Internal error", { status: 500, statusText: "Internal Server Error" })
+        new Response("Internal error", { status: 500, statusText: "Internal Server Error" }),
     ) as unknown as typeof fetch;
 
-    await expect(getHealth("http://127.0.0.1:9999")).rejects.toMatchObject({ code: "HTTP_ERROR", status: 500 });
+    await expect(getHealth("http://127.0.0.1:9999")).rejects.toMatchObject({
+      code: "HTTP_ERROR",
+      status: 500,
+    });
   });
 
   it("throws PARSE_ERROR when response body is not valid JSON", async () => {
     global.fetch = vi.fn(
-      async () => new Response("not json", { status: 200 })
+      async () => new Response("not json", { status: 200 }),
     ) as unknown as typeof fetch;
 
     await expect(getHealth("http://127.0.0.1:9999")).rejects.toMatchObject({ code: "PARSE_ERROR" });
@@ -59,7 +66,7 @@ describe("api error handling", () => {
 
   it("resolves with parsed JSON on success", async () => {
     global.fetch = vi.fn(
-      async () => new Response(JSON.stringify({ status: "ok" }), { status: 200 })
+      async () => new Response(JSON.stringify({ status: "ok" }), { status: 200 }),
     ) as unknown as typeof fetch;
 
     await expect(getHealth("http://127.0.0.1:9999")).resolves.toEqual({ status: "ok" });

@@ -1,0 +1,11 @@
+{
+  "adobe": {
+    "status": "degenerate",
+    "reason": "Adobe's homepage and sign-in page both answer a headless browser with a near-blank bot-wall / consent interstitial instead of the real page. The capture is recognised as degenerate (fewer than 3% of pixels outside the modal colour) and rejected, so no layout or thumbnail reference is shipped for Adobe.",
+    "first_observed": "2026-09-21",
+    "documented_at": "2026-10-09",
+    "attempts_before_giving_up": 4,
+    "mitigation": "scripts/data/generate_reference_hashes.ts retries each brand with a realistic browser identity (AutomationControlled disabled, en-US locale, persistent --user-data-dir profile so consent cookies are replayed). That is enough for most walls; Adobe's has not yielded. A capture from a real signed-in Chrome profile, or an operator-supplied reference, is the remaining path.",
+    "user_impact": "None beyond a missing brand: the visual layer simply has no Adobe reference, the side-by-side view shows the captured page only, and every other signal (icon match, layout hash, URL, domain, LLM) still applies."
+  }
+}

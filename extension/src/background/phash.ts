@@ -139,11 +139,10 @@ export function hammingDistanceHex(a: string, b: string): number {
   return distance;
 }
 
-/** Renders a PNG data URL into raw RGBA pixels (OffscreenCanvas, worker-safe). */
-export async function decodeDataUrlToImage(dataUrl: string): Promise<RawImage | null> {
+/** Decodes any browser-supported image blob (PNG, JPEG, WebP, ICO, SVG) into
+ * raw RGBA pixels (OffscreenCanvas, worker-safe). */
+export async function decodeBlobToImage(blob: Blob): Promise<RawImage | null> {
   try {
-    const res = await fetch(dataUrl);
-    const blob = await res.blob();
     const bitmap = await createImageBitmap(blob);
     try {
       const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
@@ -160,9 +159,147 @@ export async function decodeDataUrlToImage(dataUrl: string): Promise<RawImage | 
   }
 }
 
+/** Renders a PNG data URL into raw RGBA pixels (OffscreenCanvas, worker-safe). */
+export async function decodeDataUrlToImage(dataUrl: string): Promise<RawImage | null> {
+  try {
+    const res = await fetch(dataUrl);
+    return await decodeBlobToImage(await res.blob());
+  } catch {
+    return null;
+  }
+}
+
 /** Convenience: full pipeline from a captured PNG data URL straight to hex. */
 export async function phashFromDataUrl(dataUrl: string): Promise<string | null> {
   const img = await decodeDataUrlToImage(dataUrl);
   if (!img) return null;
   return phashHex(img);
+}
+
+function blobToDataUrl(blob: Blob): Promise<string | null> {
+  return new Promise((resolve) => {
+    try {
+      const reader = new FileReader();
+      reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : null);
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(blob);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * Sobel edge detection over an RGBA buffer, returning black lines on white.
+ *
+ * This is the heart of the "wireframe" privacy mode: it keeps the *layout* of a
+ * page (where the logo, fields and buttons sit) while discarding colour and any
+ * text small enough to be legible, so a screenshot can be shown as evidence
+ * without storing a readable copy of the page. Pure function over pixels, so it
+ * is tested directly without a canvas.
+ */
+export function sobelEdges(
+  width: number,
+  height: number,
+  rgba: Uint8ClampedArray,
+): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(width * height * 4);
+  const lum = new Float32Array(width * height);
+  for (let i = 0, p = 0; i < lum.length; i += 1, p += 4) {
+    lum[i] = 0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2];
+  }
+  const at = (x: number, y: number) => lum[y * width + x];
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const d = (y * width + x) * 4;
+      // Borders stay background: an edge needs a full 3x3 neighbourhood.
+      if (x === 0 || y === 0 || x === width - 1 || y === height - 1) {
+        out[d] = out[d + 1] = out[d + 2] = 255;
+        out[d + 3] = 255;
+        continue;
+      }
+      const tl = at(x - 1, y - 1),
+        t = at(x, y - 1),
+        tr = at(x + 1, y - 1);
+      const l = at(x - 1, y),
+        r = at(x + 1, y);
+      const bl = at(x - 1, y + 1),
+        b = at(x, y + 1),
+        br = at(x + 1, y + 1);
+      const gx = -tl - 2 * l - bl + tr + 2 * r + br;
+      const gy = -tl - 2 * t - tr + bl + 2 * b + br;
+      const magnitude = Math.hypot(gx, gy);
+      const v = magnitude > 60 ? 0 : 255;
+      out[d] = out[d + 1] = out[d + 2] = v;
+      out[d + 3] = 255;
+    }
+  }
+  return out;
+}
+
+/**
+ * Downscaled data URL of a captured screenshot, for display.
+ *
+ * The capture is already in hand (`tabs.captureVisibleTab` returns a data URL)
+ * and is otherwise discarded after hashing — so showing the evidence the verdict
+ * is based on costs one resize. Kept small (default 360px wide, JPEG q0.6) so a
+ * thumbnail is ~10-25 KB and safe to hold alongside the result in extension
+ * storage; returns null when the engine has no OffscreenCanvas/convertToBlob.
+ *
+ * `wireframe` swaps the pixel copy for an edge-only PNG, so the stored image
+ * shows the page's layout but not its colours or readable text.
+ */
+export async function thumbnailFromDataUrl(
+  dataUrl: string,
+  maxWidth = 360,
+  quality = 0.6,
+  wireframe = false,
+): Promise<string | null> {
+  try {
+    const res = await fetch(dataUrl);
+    const bitmap = await createImageBitmap(await res.blob());
+    try {
+      const scale = Math.min(1, maxWidth / bitmap.width);
+      const width = Math.max(1, Math.round(bitmap.width * scale));
+      const height = Math.max(1, Math.round(bitmap.height * scale));
+      const canvas = new OffscreenCanvas(width, height);
+      const ctx = canvas.getContext("2d");
+      if (!ctx || typeof canvas.convertToBlob !== "function") return null;
+      ctx.drawImage(bitmap, 0, 0, width, height);
+      if (wireframe) {
+        const image = ctx.getImageData(0, 0, width, height);
+        image.data.set(sobelEdges(width, height, image.data));
+        ctx.putImageData(image, 0, 0);
+        return await blobToDataUrl(await canvas.convertToBlob({ type: "image/png" }));
+      }
+      return await blobToDataUrl(await canvas.convertToBlob({ type: "image/jpeg", quality }));
+    } finally {
+      bitmap.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * pHash of a remote image (brand favicon, page icon) using THIS engine.
+ *
+ * Both sides of a comparison must be hashed by the same implementation: the
+ * JS port and Python's `imagehash` disagree on the same bytes because of the
+ * resize filter, so hashes from `data/reference_hashes.json` (built by
+ * scripts/data/generate_reference_hashes.py) are NOT comparable here. Always
+ * hash references with this function before comparing them.
+ */
+export async function phashFromUrl(url: string): Promise<string | null> {
+  try {
+    const res = await fetch(url, { credentials: "omit", cache: "no-store" });
+    if (!res.ok) return null;
+    const blob = await res.blob();
+    if (!blob.size) return null;
+    const img = await decodeBlobToImage(blob);
+    if (!img) return null;
+    return phashHex(img);
+  } catch {
+    return null;
+  }
 }

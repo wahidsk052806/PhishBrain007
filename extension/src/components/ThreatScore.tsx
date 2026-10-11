@@ -1,7 +1,14 @@
 export default function ThreatScore({ score }: { score: number }) {
   const clamped = Math.max(0, Math.min(100, Math.round(score)));
   return (
-    <div className="flex flex-col gap-1" role="meter" aria-valuenow={clamped} aria-valuemin={0} aria-valuemax={100} aria-label="Threat score">
+    <div
+      className="flex flex-col gap-1"
+      role="meter"
+      aria-valuenow={clamped}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-label="Threat score"
+    >
       <div className="flex items-baseline justify-between">
         <span className="text-2xl font-bold text-slate-100">{clamped}</span>
         <span className="text-xs text-slate-400">/ 100 threat score</span>

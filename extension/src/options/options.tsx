@@ -6,13 +6,21 @@ import {
   setSettings,
   DEFAULT_SETTINGS,
   type BannerMode,
+  type ScreenshotPrivacy,
   type Settings,
 } from "../lib/settings";
 import { DEFAULT_BACKEND_URL, DEFAULT_DASHBOARD_URL, getHealth } from "../services/api";
+import { runtimeApi } from "../lib/browser";
 
 type ConnectionStatus = "idle" | "checking" | "ok" | "error";
 
 type HostedStatus = "idle" | "checking" | "ok" | "error";
+
+interface VisualEvidenceStats {
+  screenshots: number;
+  learned: number;
+  retentionDays: number;
+}
 
 function Options() {
   const [settings, setLocalSettings] = useState<Settings>(DEFAULT_SETTINGS);
@@ -23,14 +31,49 @@ function Options() {
   const [hostedStatus, setHostedStatus] = useState<HostedStatus>("idle");
   const [hostedMessage, setHostedMessage] = useState("");
   const [newAllowlistEntry, setNewAllowlistEntry] = useState("");
+  const [visualStats, setVisualStats] = useState<VisualEvidenceStats | null>(null);
+  const [clearingVisual, setClearingVisual] = useState(false);
+  const [visualNotice, setVisualNotice] = useState<string | null>(null);
+
+  const refreshVisualStats = useCallback(async () => {
+    try {
+      const stats = await runtimeApi.sendMessage<{ type: string }, VisualEvidenceStats>({
+        type: "VISUAL_EVIDENCE_STATS",
+      });
+      setVisualStats(stats);
+    } catch {
+      setVisualStats(null);
+    }
+  }, []);
 
   useEffect(() => {
     void (async () => {
       const stored = await getSettings();
       setLocalSettings(stored);
       setLoaded(true);
+      void refreshVisualStats();
     })();
-  }, []);
+  }, [refreshVisualStats]);
+
+  const handleClearVisualEvidence = useCallback(async () => {
+    setClearingVisual(true);
+    setVisualNotice(null);
+    try {
+      const res = await runtimeApi.sendMessage<{ type: string }, { cleared: number }>({
+        type: "CLEAR_VISUAL_EVIDENCE",
+      });
+      setVisualNotice(
+        res.cleared > 0
+          ? `Removed stored screenshots from ${res.cleared} ${res.cleared === 1 ? "result" : "results"} and forgot the learned brand fingerprints.`
+          : "No stored screenshots to remove — nothing was being kept.",
+      );
+      await refreshVisualStats();
+    } catch {
+      setVisualNotice("Could not clear stored visual evidence.");
+    } finally {
+      setClearingVisual(false);
+    }
+  }, [refreshVisualStats]);
 
   const persist = useCallback(async (partial: Partial<Settings>) => {
     setLocalSettings((prev) => ({ ...prev, ...partial }));
@@ -315,6 +358,74 @@ function Options() {
           />
           Capture and visually analyse pages I visit
         </label>
+
+        <label className="flex flex-col gap-1 text-xs text-slate-300">
+          Stored screenshot style
+          <select
+            value={settings.screenshotPrivacy}
+            onChange={(e) =>
+              void persist({ screenshotPrivacy: e.target.value as ScreenshotPrivacy })
+            }
+            className="rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-slate-100"
+          >
+            <option value="pixels">Pixel thumbnail (shows the page as it looks)</option>
+            <option value="wireframe">Wireframe only (layout edges, no colour or text)</option>
+          </select>
+          <span className="text-[11px] text-slate-500">
+            The thumbnail is shown in the toolbar popup with the verdict. Wireframe keeps the page's
+            layout as black-and-white edges so you can show what was compared without storing a
+            readable copy of the page.
+          </span>
+        </label>
+
+        <label className="flex flex-col gap-1 text-xs text-slate-300">
+          Keep stored screenshots for (days)
+          <input
+            type="number"
+            min={0}
+            max={365}
+            value={settings.visualRetentionDays}
+            onChange={(e) =>
+              setLocalSettings((prev) => ({
+                ...prev,
+                visualRetentionDays: Math.max(0, Math.min(365, Number(e.target.value) || 0)),
+              }))
+            }
+            onBlur={(e) =>
+              void persist({
+                visualRetentionDays: Math.max(0, Math.min(365, Number(e.target.value) || 0)),
+              })
+            }
+            className="w-24 rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-slate-100"
+          />
+          <span className="text-[11px] text-slate-500">
+            After this many days the stored screenshot is removed automatically, keeping the
+            verdict. 0 keeps no screenshots at all — the popup then shows the text evidence only.
+          </span>
+        </label>
+
+        <div className="flex flex-col gap-2 border-t border-slate-800 pt-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-xs text-slate-400">
+              {visualStats
+                ? `${visualStats.screenshots} stored screenshot${visualStats.screenshots === 1 ? "" : "s"} · ${visualStats.learned} learned brand fingerprint${visualStats.learned === 1 ? "" : "s"}`
+                : "Visual evidence store unavailable."}
+            </span>
+            <button
+              type="button"
+              onClick={() => void handleClearVisualEvidence()}
+              disabled={clearingVisual}
+              className="rounded-md border border-red-700 bg-red-950/40 px-3 py-1.5 text-xs font-semibold text-red-200 hover:bg-red-950/70 disabled:opacity-50"
+            >
+              {clearingVisual ? "Clearing…" : "Clear all visual evidence"}
+            </button>
+          </div>
+          {visualNotice ? (
+            <p className="text-[11px] text-slate-400" aria-live="polite">
+              {visualNotice}
+            </p>
+          ) : null}
+        </div>
       </section>
 
       <section className="flex flex-col gap-3 rounded-lg border border-slate-700 bg-slate-900 p-4">

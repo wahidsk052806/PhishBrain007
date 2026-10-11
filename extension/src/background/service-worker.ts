@@ -1,4 +1,4 @@
-import { storage, tabsApi, runtimeApi, actionApi } from "../lib/browser";
+import { storage, tabsApi, runtimeApi, actionApi, notificationsApi } from "../lib/browser";
 import {
   analyzeUrl,
   analyzePage,
@@ -19,15 +19,21 @@ import {
   parseIncomingMessage,
   type CacheEntry,
 } from "./logic";
+import { runVisualScan, applyVisualToResult, persistLearnedRef } from "./visual";
 import {
-  runVisualScan,
-  applyVisualToResult,
-  persistLearnedRef,
-} from "./visual";
+  DAY_MS,
+  clearAllVisualEvidence,
+  shouldStoreImages,
+  stripVisualEvidence,
+  sweepStoredVisualEvidence,
+  visualEvidenceStats,
+} from "./visual-retention";
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
 const VISUAL_COOLDOWN_MS = 90 * 1000; // don't re-screenshot the same tab too often
 const tabCache = new Map<number, CacheEntry>();
+/** tabId:url pairs already alerted, so a rescan/visual pass never re-notifies. */
+const notifiedKeys = new Set<string>();
 
 type ServerResult = AnalysisResult & { target?: string };
 
@@ -55,8 +61,26 @@ async function setBadge(tabId: number, badge: { text: string; color: string; tit
   await actionApi.setTitle({ tabId, title: badge.title });
 }
 
-async function persistResult(tabId: number, result: AnalysisResult) {
-  const entry: CacheEntry = { result, cachedAt: Date.now() };
+/**
+ * Persist a result for a tab (in memory and in storage).
+ *
+ * `storeImages: false` is the retention-0 case ("store none"): the picture is
+ * stripped *before* it is written anywhere, so the promise the options page
+ * makes holds immediately rather than only after the next hourly sweep. It is
+ * applied to the in-memory entry too, so the popup shows exactly what is
+ * stored instead of a picture that exists only until the tab closes.
+ */
+async function persistResult(
+  tabId: number,
+  result: AnalysisResult,
+  options: { storeImages?: boolean; visualAt?: number } = {},
+) {
+  const { storeImages = true, visualAt } = options;
+  const entry: CacheEntry = {
+    result: storeImages ? result : stripVisualEvidence(result),
+    cachedAt: Date.now(),
+    ...(visualAt ? { visualAt } : {}),
+  };
   tabCache.set(tabId, entry);
   await storage.set({ [`result_${tabId}`]: entry });
 }
@@ -85,7 +109,11 @@ async function maybeAlert(result: AnalysisResult, settings: Settings): Promise<v
   }
 }
 
-async function showBanner(tabId: number, result: AnalysisResult, settings: Settings): Promise<void> {
+async function showBanner(
+  tabId: number,
+  result: AnalysisResult,
+  settings: Settings,
+): Promise<void> {
   if (!shouldShowBanner(result, settings)) return;
   try {
     await tabsApi.sendMessage(tabId, {
@@ -99,6 +127,61 @@ async function showBanner(tabId: number, result: AnalysisResult, settings: Setti
 }
 
 /**
+ * Desktop alert for a HIGH_RISK hit — the one signal that reaches the user even
+ * when they are looking at another tab. "Silent" banner mode disables it, and a
+ * `tabId:url` key keeps a rescan or the visual pass from alerting twice.
+ */
+async function notifyHighRisk(
+  tabId: number,
+  result: AnalysisResult,
+  settings: Settings,
+): Promise<void> {
+  if (settings.bannerMode === "silent") return;
+  if (result.risk_level !== "HIGH_RISK") return;
+  const key = `${tabId}:${result.url}`;
+  if (notifiedKeys.has(key)) return;
+  notifiedKeys.add(key);
+  const host = result.domain || result.url || "this page";
+  const lead = result.indicators?.[0] ?? "Multiple phishing indicators were detected.";
+  try {
+    await notificationsApi.create({
+      type: "basic",
+      iconUrl: runtimeApi.getURL("icons/icon128.png"),
+      title: `PhishBrain: high-risk page (${Math.round(result.threat_score)}/100)`,
+      message: `${host} — ${lead}`,
+    });
+  } catch {
+    // Notifications are best-effort; a missing permission must never break a scan.
+  }
+}
+
+let lastVisualSweepAt = 0;
+const VISUAL_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+
+/**
+ * Enforce the screenshot-evidence retention policy over both the persisted
+ * results and the in-memory cache.
+ *
+ * Throttled to once an hour, so a scan storm never turns into a storage walk;
+ * `force` is used at browser launch, when the age check is what actually
+ * matters. A window of 0 means "store none" and strips every result.
+ */
+async function applyVisualRetention(force = false): Promise<number> {
+  if (!force && Date.now() - lastVisualSweepAt < VISUAL_SWEEP_INTERVAL_MS) return 0;
+  lastVisualSweepAt = Date.now();
+  const settings = await getSettings();
+  const stripped = await sweepStoredVisualEvidence(settings.visualRetentionDays);
+  const windowMs = Math.max(0, settings.visualRetentionDays) * DAY_MS;
+  const now = Date.now();
+  for (const [tabId, entry] of tabCache) {
+    if (now - (entry.cachedAt ?? 0) <= windowMs) continue;
+    const next = stripVisualEvidence(entry.result);
+    if (next !== entry.result) tabCache.set(tabId, { ...entry, result: next });
+  }
+  return stripped;
+}
+
+/**
  * Single funnel for every completed scan: persist the cache, update the
  * toolbar badge, fire the opt-in webhook and show the warning banner.
  */
@@ -109,10 +192,15 @@ async function finalizeScan(
   settings: Settings,
 ): Promise<AnalysisResult> {
   const normalized = normalizeResult(result);
-  await persistResult(tabId, normalized);
+  await persistResult(tabId, normalized, {
+    storeImages: shouldStoreImages(settings.visualRetentionDays),
+  });
   await setBadge(tabId, badgeForResult(normalized));
   void maybeAlert(normalized, settings);
+  void notifyHighRisk(tabId, normalized, settings);
   await showBanner(tabId, normalized, settings);
+  // Lazy enforcement of the evidence-retention policy (throttled internally).
+  void applyVisualRetention();
   return normalized;
 }
 
@@ -136,7 +224,7 @@ async function runVisualIfEnabled(
   if (Date.now() - lastVisualAt < VISUAL_COOLDOWN_MS) return result;
 
   const attach = async (): Promise<AnalysisResult> => {
-    const scan = await runVisualScan(tabId, url);
+    const scan = await runVisualScan(tabId, url, settings.screenshotPrivacy === "wireframe");
     if (!scan) return result;
     if (scan.learnBrand && scan.outcome.phash) {
       // The user is on the genuine brand login: remember its fingerprint from
@@ -145,11 +233,13 @@ async function runVisualIfEnabled(
     }
     const merged = applyVisualToResult(result, scan.outcome);
     if (merged !== result) {
-      const entry: CacheEntry = { result: merged, cachedAt: Date.now(), visualAt: Date.now() };
-      tabCache.set(tabId, entry);
-      await storage.set({ [`result_${tabId}`]: entry });
+      await persistResult(tabId, merged, {
+        storeImages: shouldStoreImages(settings.visualRetentionDays),
+        visualAt: Date.now(),
+      });
       await setBadge(tabId, badgeForResult(merged));
       void maybeAlert(merged, settings);
+      void notifyHighRisk(tabId, merged, settings);
       await showBanner(tabId, merged, settings);
     }
     return merged;
@@ -366,8 +456,40 @@ runtimeApi.onMessage.addListener((raw, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "CLEAR_VISUAL_EVIDENCE") {
+    void (async () => {
+      try {
+        const cleared = await clearAllVisualEvidence();
+        for (const [tabId, entry] of tabCache) {
+          const next = stripVisualEvidence(entry.result);
+          if (next !== entry.result) tabCache.set(tabId, { ...entry, result: next });
+        }
+        sendResponse({ cleared });
+      } catch {
+        sendResponse({ cleared: 0 });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "VISUAL_EVIDENCE_STATS") {
+    void (async () => {
+      try {
+        const settings = await getSettings();
+        const stats = await visualEvidenceStats();
+        sendResponse({ ...stats, retentionDays: settings.visualRetentionDays });
+      } catch {
+        sendResponse({ screenshots: 0, learned: 0, retentionDays: 0 });
+      }
+    })();
+    return true;
+  }
+
   return false;
 });
+
+runtimeApi.onStartup.addListener(() => void applyVisualRetention(true));
+runtimeApi.onInstalled.addListener(() => void applyVisualRetention(true));
 
 void (async () => {
   const settings = await getSettings();
