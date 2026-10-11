@@ -102,11 +102,37 @@ or `npx wrangler --cwd .output dev` for a Cloudflare deploy.
 
 ## API Reference
 
-| Endpoint          | Method | Description                                                 |
-| ----------------- | ------ | ----------------------------------------------------------- |
-| `/api/v1/analyze` | POST   | Submits content (URL/Email) for full multi-layer analysis.  |
-| `/api/v1/history` | GET    | Retrieves a paginated list of previous analysis results.    |
-| `/api/v1/health`  | GET    | Returns the system status and connectivity to sub-services. |
+| Endpoint                     | Method | Description                                                 |
+| ---------------------------- | ------ | ----------------------------------------------------------- |
+| `/api/v1/analyze`            | POST   | Submits content (URL/Email) for full multi-layer analysis.  |
+| `/api/v1/analyze/url/stream` | POST   | Same scan, streamed as Server-Sent Events (see below).      |
+| `/api/v1/history`            | GET    | Retrieves a paginated list of previous analysis results.    |
+| `/api/v1/health`             | GET    | Returns the system status and connectivity to sub-services. |
+
+### Progressive results (why a scan no longer feels like a 60 s hang)
+
+The local LLM is 80-90% of a full scan, so waiting for one response meant staring at nothing
+for a minute while information that already existed at 5 s sat unsent. `POST
+/api/v1/analyze/url/stream` reports each stage as it completes instead:
+
+| Event            | When                    | Payload                                                                 |
+| ---------------- | ----------------------- | ----------------------------------------------------------------------- |
+| `started`        | immediately             | the normalised target                                                   |
+| `layer`/`layers` | as each layer finishes  | `url`, then `domain` + `webpage` evidence                               |
+| `prefilter`      | after the ML pre-filter | score, method, calibration                                              |
+| `provisional`    | before the LLM runs     | a **labelled** score over the deterministic layers only                 |
+| `llm`            | when the verdict lands  | the LLM assessment (and the webpage layer, now carrying the screenshot) |
+| `final`          | at the end              | the same payload as the non-streaming endpoint                          |
+
+Measured on the reference box for an uncached `example.com` scan: `started` at 2 s, first
+layer at 3 s, **provisional score at 5 s**, LLM verdict at 47 s. The dashboard renders the
+provisional report immediately (banner: "PROVISIONAL — ... the on-device LLM reasoning step
+is still running") and replaces it in place when the verdict arrives. A refused target is
+still a plain 4xx with the same body as the non-streaming endpoint, so a refusal is never
+mistaken for a stalled stream.
+
+A streaming _cache hit_ resolves immediately and skips the intermediate events, since the
+finished result already exists.
 
 ### Scan latency, and how to make it faster
 
@@ -124,7 +150,9 @@ measured 5.3-5.9 tokens/s generation and ~39 tokens/s prefill here, so a 600-tok
 an 80-token answer is ~30 s of the scan on its own. `use_llm: false` is the supported fast path
 for bulk work and pre-filter-only triage. The backend warms the model in the background at
 startup (`LLM_WARMUP_ON_STARTUP`), which removes the ~15-30 s first-scan penalty after a
-restart; `LLM_KEEP_ALIVE` keeps it resident between scans.
+restart; `LLM_KEEP_ALIVE` keeps it resident between scans. For interactive use the dashboard
+streams the scan instead (see _Progressive results_ above), so the deterministic verdict is
+on screen in ~5 s even when the LLM needs a further 45 s.
 
 What made the difference (each was a measured fix, not a guess):
 

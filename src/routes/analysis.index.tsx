@@ -118,9 +118,15 @@ function AnalyzePage() {
     setResult(null);
 
     // 1. Self-hosted FastAPI backend (full pipeline incl. Ollama + Playwright).
+    // Streamed: the deterministic layers and the ML pre-filter land in a few
+    // seconds and the report renders then, with the LLM verdict replacing it in
+    // place when it arrives. Waiting for the whole pipeline meant ~40s of blank
+    // screen for information that was already known after five.
     try {
-      const res = await api.analyzeUrl(target);
-      setResult(res);
+      await api.analyzeUrlStream(target, {
+        onPartial: (partial) => setResult(partial),
+        onFinal: (final) => setResult(final),
+      });
       setBusy(false);
       return;
     } catch (err) {
@@ -359,7 +365,7 @@ function AnalyzePage() {
             ) : (
               <ScanSearch aria-hidden="true" className="size-4" />
             )}
-            Analyze
+            {busy ? (result?.provisional ? "LLM verdict…" : "Analyzing…") : "Analyze"}
           </button>
           {loadedSample && loadedSample.kind !== "email" ? (
             <p className="flex w-full flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-suspicious">

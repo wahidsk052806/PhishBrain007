@@ -12,6 +12,7 @@ import hashlib
 import json
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -231,6 +232,7 @@ async def run_analysis(
     screenshot_base64: str | None = None,
     raw_input: dict | None = None,
     skip_llm: bool = False,
+    on_event: Callable[[dict], Awaitable[None]] | None = None,
 ) -> AnalysisResult:
     """Run the full multi-layer phishing analysis pipeline for a URL, email,
     or webpage input and persist/cache the result."""
@@ -243,6 +245,24 @@ async def run_analysis(
         now = time.monotonic()
         marks[name] = round((now - since) * 1000, 1)
         return now
+
+    async def emit(event: dict) -> None:
+        """Push a progress event to a streaming caller, if there is one.
+
+        Best-effort on purpose: a slow, gone or cancelled consumer must never
+        change the scan itself, so a failing handler is logged and dropped
+        instead of propagated. A full scan spends most of its wall time in the
+        local LLM, so without this a useful result only exists at the end.
+        """
+        if on_event is None:
+            return
+        try:
+            await on_event(event)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("progress event dropped", extra={"extra_fields": {"error": str(exc)}})
+
+    def layer_snapshot() -> list[dict]:
+        return [layer.model_dump(mode="json") for layer in layers.values()]
 
     degraded: list[str] = []
     layers: dict[str, LayerEvidence] = {}
@@ -283,6 +303,8 @@ async def run_analysis(
             degraded.append("url.error")
             logger.warning("URL layer failed", extra={"extra_fields": {"error": str(exc)}})
     phase = mark("url_ms", phase)
+    if layers.get("url"):
+        await emit({"type": "layer", "layer_evidence": layer_snapshot()})
 
     # Fetch the page exactly once. It is needed by two consumers — the webpage
     # layer and the LLM's view of the page — and the fetch used to happen
@@ -391,11 +413,49 @@ async def run_analysis(
 
     layer_list = list(layers.values())
     phase = mark("collect_ms", phase)
+    await emit({"type": "layers", "layer_evidence": layer_snapshot()})
 
     prefilter = get_prefilter()
     prefilter_result = prefilter.score(_prefilter_features(layers, url))
     if not prefilter_result.get("model_trained"):
         degraded.append("ml.deterministic_fallback")
+
+    # The pre-filter needs no LLM, so its contribution is known early and is
+    # worth reporting on its own rather than waiting for the verdict.
+    prefilter_snapshot = {
+        "model_trained": bool(prefilter_result.get("model_trained")),
+        "score": prefilter_result.get("score"),
+        "method": prefilter_result.get("method"),
+        "raw_score": prefilter_result.get("raw_score"),
+        "calibrated": bool(prefilter_result.get("calibrated")),
+    }
+    await emit({"type": "prefilter", "prefilter": prefilter_snapshot})
+
+    # A provisional score over the deterministic layers only. It is deliberately
+    # labelled as such: the LLM adjustment can move the final number, and a
+    # reader must not mistake this for the verdict.
+    provisional = score_analysis(
+        layer_list,
+        None,
+        list(degraded),
+        prefilter_score=prefilter_result["score"],
+        prefilter_model_trained=bool(prefilter_result.get("model_trained")),
+    )
+    await emit(
+        {
+            "type": "provisional",
+            "provisional": True,
+            "threat_score": provisional["threat_score"],
+            "risk_level": provisional["risk_level"],
+            "confidence": provisional["confidence"],
+            "indicators": provisional["indicators"],
+            "explanation": provisional["explanation"],
+            "recommended_action": provisional["recommended_action"],
+            "degraded": list(degraded),
+            "layer_evidence": layer_snapshot(),
+            "prefilter": prefilter_snapshot,
+        }
+    )
 
     top_indicators: list[str] = []
     for layer in layer_list:
@@ -484,6 +544,18 @@ async def run_analysis(
         for step in concurrent_tail:
             await step
     phase = mark("llm_visual_ms", phase)
+    # Carry the layer snapshot too: the visual evidence (screenshot thumbnail and
+    # brand comparison) is attached to the webpage layer in the tail above, so
+    # this is the first moment it can be shown.
+    await emit(
+        {
+            "type": "llm",
+            "llm_assessment": (
+                llm_assessment.model_dump(mode="json") if llm_assessment is not None else None
+            ),
+            "layer_evidence": layer_snapshot(),
+        }
+    )
 
     scoring = score_analysis(
         layer_list,

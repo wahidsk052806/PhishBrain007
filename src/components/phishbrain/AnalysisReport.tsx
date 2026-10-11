@@ -1,4 +1,4 @@
-import { Download, FlaskConical, TriangleAlert } from "lucide-react";
+import { Download, FlaskConical, Loader2, TriangleAlert } from "lucide-react";
 import type { AnalysisResult } from "@/lib/phishbrain/types";
 import { api } from "@/lib/phishbrain/api";
 import { describeDegraded } from "@/lib/phishbrain/normalize";
@@ -67,6 +67,17 @@ export function AnalysisReport({ result }: { result: AnalysisResult }) {
           <span>
             <strong className="font-mono">DEMO DATA</strong> — produced offline by the deterministic
             demo engine. This is not a live detection.
+          </span>
+        </p>
+      ) : null}
+
+      {result.provisional ? (
+        <p className="flex items-center gap-2 rounded-md border border-primary/40 bg-primary/10 px-3 py-2 text-sm text-primary">
+          <Loader2 aria-hidden="true" className="size-4 shrink-0 animate-spin" />
+          <span>
+            <strong className="font-mono">PROVISIONAL</strong> — the capture, multi-layer and ML
+            pre-filter stages have finished, so this score is real; the on-device LLM reasoning step
+            is still running and can adjust it. This report updates in place when the verdict lands.
           </span>
         </p>
       ) : null}

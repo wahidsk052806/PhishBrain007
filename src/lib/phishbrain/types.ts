@@ -131,6 +131,13 @@ export interface AnalysisResult {
   degraded: string[];
   /** True when the result was produced by the labelled demo pipeline. */
   demo: boolean;
+  /**
+   * True while this is an interim result: the deterministic layers and the
+   * pre-filter have finished but the local LLM verdict is still being produced
+   * server-side (see `api.analyzeUrlStream`). The score is real, but it can
+   * still move when the LLM adjustment is applied.
+   */
+  provisional?: boolean;
 }
 
 export interface HealthStatus {

@@ -1,11 +1,13 @@
 """Version 1 API routes for PhishBrain."""
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
+import json
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
 from app.cache.store import get_cache
 from app.core.config import get_settings
@@ -34,6 +36,19 @@ from app.services.pipeline import run_analysis
 
 logger = get_logger(__name__)
 router = APIRouter()
+
+# Server-Sent Events framing. `no-transform` and `X-Accel-Buffering` stop
+# intermediaries from buffering the stream into a single late response, which
+# would defeat the point of streaming at all.
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload, default=str)}\n\n"
 
 
 def _error_response(exc: Exception, status_code: int = 500) -> HTTPException:
@@ -70,6 +85,92 @@ async def analyze_url_endpoint(payload: URLAnalyzeRequest):
         raise
     except Exception as exc:  # noqa: BLE001
         raise _error_response(exc) from exc
+
+
+@router.post("/analyze/url/stream")
+async def analyze_url_stream_endpoint(payload: URLAnalyzeRequest):
+    """Run a URL scan and stream its progress as Server-Sent Events.
+
+    A full scan on CPU-only hardware spends most of its wall time inside the
+    local LLM, so the single-response endpoint made a useful report appear only
+    after ~30s of nothing. This emits each deterministic layer, the pre-filter
+    contribution and a clearly-labelled provisional score as soon as they
+    exist, then the LLM verdict and the final scored result — so the report
+    fills in progressively instead of hanging on a spinner.
+
+    Events: `started`, `layer`, `layers`, `prefilter`, `provisional`, `llm`,
+    `final`, `error`. The final event carries the same payload as the
+    non-streaming endpoint.
+    """
+    try:
+        # Normalise and guard before opening the stream, so a refusal is still a
+        # plain 4xx with the same body the non-streaming endpoint returns.
+        if payload.demo:
+            demo_result = build_demo_result("url", payload.url)
+
+            async def demo_stream():
+                yield _sse({"type": "started", "target": payload.url})
+                yield _sse({"type": "final", "result": demo_result.model_dump(mode="json")})
+
+            return StreamingResponse(demo_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+        try:
+            target, _ = guard_user_target(payload.url)
+        except SSRFBlockedError as exc:
+            raise HTTPException(status_code=400, detail=f"URL rejected: {exc}") from exc
+
+        request_payload = payload.model_dump()
+        request_payload["url"] = target
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _error_response(exc) from exc
+
+    queue: asyncio.Queue = asyncio.Queue()
+    _finished = object()
+
+    async def on_event(event: dict) -> None:
+        await queue.put(event)
+
+    async def runner() -> None:
+        try:
+            result = await run_analysis(
+                "url",
+                target,
+                url=target,
+                dom_summary=payload.dom_summary,
+                fetch_page_flag=payload.fetch_page,
+                skip_llm=not payload.use_llm,
+                raw_input=request_payload,
+                on_event=on_event,
+            )
+            await queue.put({"type": "final", "result": result.model_dump(mode="json")})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("streamed scan failed", extra={"extra_fields": {"error": str(exc)}})
+            await queue.put(
+                {"type": "error", "message": "The scan failed before a verdict was produced."}
+            )
+        finally:
+            await queue.put(_finished)
+
+    task = asyncio.create_task(runner())
+
+    async def event_stream():
+        try:
+            yield _sse({"type": "started", "target": target})
+            while True:
+                item = await queue.get()
+                if item is _finished:
+                    break
+                yield _sse(item)
+        finally:
+            # The client hung up: stop the scan rather than leave it running
+            # with nowhere to deliver its result.
+            task.cancel()
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @router.post("/analyze/email")
