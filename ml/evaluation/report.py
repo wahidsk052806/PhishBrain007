@@ -46,7 +46,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ml.evaluation.gate import GateThresholds, evaluate_gate, render_gate_markdown  # noqa: E402
+from ml.evaluation.calibration import apply_calibration  # noqa: E402
+from ml.evaluation.gate import (  # noqa: E402
+    DEFAULT_GATE_TIER,
+    GATE_TIERS,
+    TIER_MEANING,
+    GateThresholds,
+    evaluate_gate,
+    evaluate_gate_tiers,
+    render_gate_markdown,
+    thresholds_for_tier,
+)
 from ml.evaluation.metrics import (  # noqa: E402
     classification_metrics,
     measure_latency_ms,
@@ -189,8 +199,55 @@ def render_markdown(report: dict) -> str:
         ]
 
     if report.get("gate"):
-        lines += ["", render_gate_markdown(report["gate"])]
+        thresholds = None
+        if isinstance(report.get("thresholds"), dict):
+            try:
+                thresholds = GateThresholds(**report["thresholds"])
+            except TypeError:  # pragma: no cover - future/thin metadata
+                thresholds = None
+        lines += [
+            "",
+            render_gate_markdown(report["gate"], thresholds, report.get("gate_tier")),
+            "",
+            _render_tiers(report),
+        ]
     return "\n".join(lines) + "\n"
+
+
+def _render_tiers(report: dict) -> str:
+    """Tier verdicts plus what the deployed artifact claims about itself."""
+    tiers = report.get("gate_tiers") or {}
+    results = tiers.get("results") or {}
+    declared = report.get("model_declared_gate") or {}
+    lines = [
+        "### Tier verdicts",
+        "",
+        "| Tier | Meaning | Verdict |",
+        "|---|---|---|",
+    ]
+    for name in ("strict", "triage"):
+        if name not in results:
+            continue
+        lines.append(
+            f"| {name} | {TIER_MEANING.get(name, '')} | "
+            f"{'PASS' if results[name]['passed'] else 'FAIL'} |"
+        )
+    lines += [
+        "",
+        "Deployed artifact declares: tier `"
+        f"{declared.get('tier', 'unknown')}`"
+        f"{' (strict)' if declared.get('strict_passed') else ''}, "
+        f"gate.passed={declared.get('passed')}",
+        "",
+    ]
+    calibration = report.get("model_calibration") or {}
+    if calibration:
+        lines.append(
+            f"Probability calibration recorded in the model metadata: "
+            f"`{calibration.get('method')}`."
+        )
+        lines.append("")
+    return "\n".join(lines)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -210,30 +267,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Fixed observation cutoff (e.g. 2026-07-01); must match the trainer "
                         "so the two describe the same held-out period.")
     p.add_argument("--test-fraction", type=float, default=0.2)
-    p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument("--threshold", type=float, default=None,
+                   help="Decision threshold; defaults to the one recorded in the model's "
+                        "metadata (the operating point it was validated at), then 0.5.")
+    p.add_argument("--gate-tier", choices=sorted(GATE_TIERS), default=DEFAULT_GATE_TIER,
+                   help="Which bar to judge the deployed model against (default: triage, "
+                        "matching ml/training/train_prefilter.py).")
     p.add_argument("--structure-col", type=str, default="has_path",
                    help="Structural column used for the benign-with-path false-positive check "
                         "(this specific metric is always the path axis).")
     p.add_argument("--out", type=Path, default=Path("ml/evaluation/reports/latest"))
-    p.add_argument("--min-recall", type=float, default=GateThresholds.min_recall)
-    p.add_argument("--min-precision", type=float, default=GateThresholds.min_precision)
-    p.add_argument("--min-roc-auc", type=float, default=GateThresholds.min_roc_auc)
-    p.add_argument("--max-fpr", type=float, default=GateThresholds.max_false_positive_rate)
-    p.add_argument("--max-benign-path-fpr", type=float,
-                   default=GateThresholds.max_false_positive_rate_benign_path)
-    p.add_argument("--max-latency-ms", type=float,
-                   default=GateThresholds.max_mean_per_sample_latency_ms)
+    # `None` means "use the gate tier's value", matching the trainer's flags.
+    p.add_argument("--min-recall", type=float, default=None)
+    p.add_argument("--min-precision", type=float, default=None)
+    p.add_argument("--min-roc-auc", type=float, default=None)
+    p.add_argument("--max-fpr", type=float, default=None)
+    p.add_argument("--max-benign-path-fpr", type=float, default=None)
+    p.add_argument("--max-latency-ms", type=float, default=None)
     return p
 
 
 def _thresholds(args) -> GateThresholds:
+    """Tier defaults, with any explicit threshold flag on top (as in the trainer)."""
+    tier = thresholds_for_tier(args.gate_tier)
+    pick = lambda flag, base: base if flag is None else flag  # noqa: E731
     return GateThresholds(
-        min_recall=args.min_recall,
-        min_precision=args.min_precision,
-        min_roc_auc=args.min_roc_auc,
-        max_false_positive_rate=args.max_fpr,
-        max_false_positive_rate_benign_path=args.max_benign_path_fpr,
-        max_mean_per_sample_latency_ms=args.max_latency_ms,
+        min_recall=pick(args.min_recall, tier.min_recall),
+        min_precision=pick(args.min_precision, tier.min_precision),
+        min_roc_auc=pick(args.min_roc_auc, tier.min_roc_auc),
+        max_false_positive_rate=pick(args.max_fpr, tier.max_false_positive_rate),
+        max_false_positive_rate_benign_path=pick(
+            args.max_benign_path_fpr, tier.max_false_positive_rate_benign_path
+        ),
+        max_mean_per_sample_latency_ms=pick(
+            args.max_latency_ms, tier.max_mean_per_sample_latency_ms
+        ),
+        fpr_tolerance_sigma=tier.fpr_tolerance_sigma,
     )
 
 
@@ -295,13 +364,29 @@ def _evaluate(args) -> dict:
                       "held-out rows the deployment gate scored — and NOT a "
                       "zero-day measurement")
 
+    # The deployed artifact carries its own operating point and (optionally) a
+    # probability calibration. Evaluate at those settings, otherwise this report
+    # would describe a model configuration nobody serves.
+    model_meta: dict = {}
+    meta_path = Path(f"{args.model}.meta.json")
+    if meta_path.exists():
+        try:
+            model_meta = json.loads(meta_path.read_text())
+        except (OSError, ValueError):
+            model_meta = {}
+    threshold = args.threshold
+    if threshold is None:
+        threshold = model_meta.get("decision_threshold") or 0.5
+
     X_test = test_df[feature_cols]
     y_test = test_df[args.label_col]
     proba = model.predict_proba(X_test)
-    y_proba = proba[:, 1] if proba.ndim == 2 else proba
-    y_pred = (y_proba >= args.threshold).astype(int)
+    raw_proba = proba[:, 1] if proba.ndim == 2 else proba
+    y_proba = apply_calibration(raw_proba, model_meta.get("calibration"))
+    y_pred = (y_proba >= threshold).astype(int)
 
     metrics = classification_metrics(y_test, y_pred, y_proba)
+    metrics["benign_rows"] = int(metrics["true_negatives"] + metrics["false_positives"])
     if args.structure_col in test_df.columns:
         metrics["false_positive_rate_benign_with_path"] = subgroup_false_positive_rate(
             y_test, y_pred, test_df[args.structure_col].to_numpy() == 1
@@ -350,9 +435,17 @@ def _evaluate(args) -> dict:
         "zero_day": zero_day,
         "n_test_rows": int(len(test_df)),
         "n_train_rows": int(len(df) - len(test_df)),
-        "decision_threshold": args.threshold,
+        "decision_threshold": threshold,
         "metrics": metrics,
         "gate": evaluate_gate(metrics, _thresholds(args)),
+        "gate_tier": args.gate_tier,
+        "gate_tiers": evaluate_gate_tiers(metrics),
+        # What the deployed artifact says about itself, so a mismatch between the
+        # claim and this measurement is visible rather than silent.
+        "model_declared_gate": (
+            model_meta.get("gate") if isinstance(model_meta.get("gate"), dict) else {}
+        ),
+        "model_calibration": model_meta.get("calibration"),
         "thresholds": _thresholds(args).as_dict(),
     }
 

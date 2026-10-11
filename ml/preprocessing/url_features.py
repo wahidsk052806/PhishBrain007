@@ -165,7 +165,15 @@ def extract_url_features(url: str) -> URLFeatures:
         return feats
 
     parsed = urlsplit(url if "://" in url else f"http://{url}")
+    # `hostname` is safe, but `port` raises ValueError on anything that is not a
+    # valid port — `javascript:alert(1)` parses to a netloc whose port is
+    # `alert(1)`. Feature extraction runs over arbitrary feed and API input, so
+    # a raise here would abort scoring for the whole batch.
     hostname = parsed.hostname or ""
+    try:
+        has_port = parsed.port is not None
+    except ValueError:
+        has_port = False
     path = parsed.path or ""
     query = parsed.query or ""
 
@@ -180,7 +188,7 @@ def extract_url_features(url: str) -> URLFeatures:
     feats.has_ip_host = int(bool(_IP_RE.match(hostname)))
     feats.has_at_symbol = int("@" in url)
     feats.has_https = int(parsed.scheme == "https")
-    feats.has_port = int(parsed.port is not None)
+    feats.has_port = int(has_port)
     feats.is_shortener = int(hostname.lower() in _SHORTENERS)
     feats.num_query_params = len([p for p in query.split("&") if p])
 

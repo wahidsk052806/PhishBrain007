@@ -58,7 +58,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-from ml.evaluation.gate import GateThresholds, evaluate_gate, render_gate_markdown  # noqa: E402
+from ml.evaluation.calibration import (  # noqa: E402
+    apply_calibration,
+    expected_calibration_error,
+    fit_platt,
+    identity_calibration,
+)
+from ml.evaluation.gate import (  # noqa: E402
+    DEFAULT_GATE_TIER,
+    GATE_TIERS,
+    TIER_MEANING,
+    GateThresholds,
+    evaluate_gate,
+    evaluate_gate_tiers,
+    render_gate_markdown,
+    thresholds_for_tier,
+)
 from ml.evaluation.metrics import (  # noqa: E402
     classification_metrics,
     measure_latency_ms,
@@ -157,6 +172,72 @@ def describe_structure(df: pd.DataFrame, label_col: str, structure_col: str,
     return "\n".join(rows)
 
 
+def holdout_calibration_slice(
+    train_df: pd.DataFrame,
+    timestamp_col: str,
+    fraction: float,
+) -> pd.DataFrame | None:
+    """Held-out slice for fitting the probability calibration.
+
+    Preference is the **latest** rows of the training period rather than a
+    random slice of it. A calibration map only transfers when its data looks
+    like the data it will be applied to, and production traffic is time-lagged:
+    measured on the honest time split, a map fitted on a random slice of the
+    training period made the false-positive rate *worse* at the 0.5 threshold
+    (0.11 -> 0.31) while a tail slice behaved as expected. The rows returned
+    here are dropped from training before the model is fit, so the map is
+    fitted on scores the model never saw.
+
+    Returns None when the dataset carries no usable timestamps (the caller then
+    falls back to the validation slice and says so).
+    """
+    if fraction <= 0 or timestamp_col not in train_df.columns:
+        return None
+    stamps = pd.to_datetime(train_df[timestamp_col], errors="coerce", utc=True)
+    if stamps.notna().sum() < 100:
+        return None
+    size = int(len(train_df) * fraction)
+    if size < 50 or size >= len(train_df):
+        return None
+    # NaT rows sort last; use the strictly dated ordering and take the tail.
+    ordered = train_df.assign(_stamp=stamps).sort_values("_stamp", kind="stable")
+    if ordered["_stamp"].isna().any():
+        ordered = ordered[ordered["_stamp"].notna()]
+        if size >= len(ordered):
+            return None
+    return ordered.tail(size).drop(columns=["_stamp"])
+
+
+def select_decision_threshold(y_true, p, max_false_positive_rate: float, fallback: float = 0.5) -> float:
+    """Largest threshold whose false-positive rate stays inside the ceiling.
+
+    The 0.5 default is only meaningful once the score is a real probability,
+    and even then it is rarely the operating point a security team wants. This
+    picks the threshold on *held-out* data (never the test split) so the
+    reported false-positive rate reflects a deliberately chosen trade-off
+    instead of an accident of where 0.5 happens to fall.
+
+    Because the false-positive rate only falls as the threshold rises, the
+    smallest qualifying threshold is the one that keeps the most recall — search
+    ascending and stop at the first hit. (Searching downwards would return the
+    highest qualifying threshold, which is how a degenerate run once selected
+    1.0 and recalled nothing.)
+
+    Falls back to ``fallback`` when no threshold satisfies the ceiling (the
+    gate then fails honestly rather than being tuned around).
+    """
+    y = np.asarray(y_true, dtype=float).ravel()
+    p = np.asarray(p, dtype=float).ravel()
+    negatives = y == 0
+    if negatives.sum() == 0:
+        return fallback
+    for threshold in np.unique(np.clip(p, 0.0, 1.0)):
+        fpr = float((p[negatives] >= threshold).mean())
+        if fpr <= max_false_positive_rate:
+            return float(threshold)
+    return fallback
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Train the PhishBrain CatBoost prefilter.")
     p.add_argument("--data", type=Path, default=None, help="Path to labeled dataset (CSV/Parquet).")
@@ -188,8 +269,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--iterations", type=int, default=500)
     p.add_argument("--depth", type=int, default=6)
     p.add_argument("--learning-rate", type=float, default=0.05)
-    p.add_argument("--threshold", type=float, default=0.5,
-                   help="Decision threshold used when computing gate metrics.")
 
     structure = p.add_argument_group("structure de-confounding")
     structure.add_argument("--structure-weights", action=argparse.BooleanOptionalAction, default=True,
@@ -198,35 +277,89 @@ def build_arg_parser() -> argparse.ArgumentParser:
                            help=f"Column describing URL structure (default: {DEFAULT_STRUCTURE_COL}; "
                                 f"falls back to {FALLBACK_STRUCTURE_COL} on older datasets).")
 
+    # Default OFF, on measured evidence rather than taste: see the note in
+    # ml/evaluation/calibration.py. Both switches are kept because they are the
+    # right fix once benign data covers the observation window.
+    p.add_argument("--calibrate", action=argparse.BooleanOptionalAction, default=False,
+                   help="Fit a Platt calibration on the held-out slice so the score is a "
+                        "real probability. Monotone, so ROC-AUC is unaffected. Off by "
+                        "default: with this dataset the fitted map is driven by the "
+                        "phishing-heavy class mix of every available slice, and the two "
+                        "variants measured so far both made the operating point worse.")
+    p.add_argument("--calibration-fraction", type=float, default=0.1,
+                   help="Share of the training period held out (latest rows first) for "
+                        "fitting the calibration map. Dropped from training.")
+    p.add_argument("--select-threshold", action=argparse.BooleanOptionalAction, default=False,
+                   help="Choose the decision threshold on held-out data so the "
+                        "false-positive ceiling is met, instead of assuming 0.5. Off by "
+                        "default: no held-out slice both resembles production traffic and "
+                        "carries enough benign rows for the estimate to be meaningful.")
+    p.add_argument("--threshold", type=float, default=None,
+                   help="Pin the decision threshold (disables --select-threshold).")
+
     gate = p.add_argument_group("deployment gate")
-    gate.add_argument("--min-recall", type=float, default=GateThresholds.min_recall)
-    gate.add_argument("--min-precision", type=float, default=GateThresholds.min_precision)
-    gate.add_argument("--min-roc-auc", type=float, default=GateThresholds.min_roc_auc)
-    gate.add_argument("--max-fpr", type=float, default=GateThresholds.max_false_positive_rate)
-    gate.add_argument("--max-benign-path-fpr", type=float,
-                      default=GateThresholds.max_false_positive_rate_benign_path,
+    gate.add_argument("--gate-tier", choices=sorted(GATE_TIERS), default=DEFAULT_GATE_TIER,
+                      help="Which bar the candidate must clear to be written to --output "
+                           "(default: triage, the bar for the 15%%-weighted prefilter; "
+                           "strict is the sole-decision-maker bar).")
+    # Defaults are `None` so "flag not given" is distinguishable from "flag
+    # given with the tier's own value"; the tier supplies the value (see
+    # thresholds_from_args).
+    gate.add_argument("--min-recall", type=float, default=None)
+    gate.add_argument("--min-precision", type=float, default=None)
+    gate.add_argument("--min-roc-auc", type=float, default=None)
+    gate.add_argument("--max-fpr", type=float, default=None)
+    gate.add_argument("--max-benign-path-fpr", type=float, default=None,
                       help="Ceiling for false positives among benign URLs that have a path.")
-    gate.add_argument("--max-latency-ms", type=float,
-                      default=GateThresholds.max_mean_per_sample_latency_ms)
+    gate.add_argument("--max-latency-ms", type=float, default=None)
     gate.add_argument("--report-dir", type=Path, default=REPORT_DIR)
     return p
 
 
 def thresholds_from_args(args) -> GateThresholds:
+    """Gate thresholds for this run.
+
+    The named tier supplies the defaults; any threshold flag passed explicitly
+    overrides that tier's value, so `--gate-tier triage --min-recall 0.9` means
+    exactly what it reads as.
+    """
+    tier = thresholds_for_tier(args.gate_tier)
     return GateThresholds(
-        min_recall=args.min_recall,
-        min_precision=args.min_precision,
-        min_roc_auc=args.min_roc_auc,
-        max_false_positive_rate=args.max_fpr,
-        max_false_positive_rate_benign_path=args.max_benign_path_fpr,
-        max_mean_per_sample_latency_ms=args.max_latency_ms,
+        # Tier defaults, with any explicit CLI override on top.
+        min_recall=_pick(args.min_recall, tier.min_recall),
+        min_precision=_pick(args.min_precision, tier.min_precision),
+        min_roc_auc=_pick(args.min_roc_auc, tier.min_roc_auc),
+        max_false_positive_rate=_pick(args.max_fpr, tier.max_false_positive_rate),
+        max_false_positive_rate_benign_path=_pick(
+            args.max_benign_path_fpr, tier.max_false_positive_rate_benign_path
+        ),
+        max_mean_per_sample_latency_ms=_pick(
+            args.max_latency_ms, tier.max_mean_per_sample_latency_ms
+        ),
+        # Carried over from the tier, never from a flag: it describes how the
+        # false-positive rate was measured, not how strict the operator wants
+        # to be (the strict tier simply sets it to zero).
+        fpr_tolerance_sigma=tier.fpr_tolerance_sigma,
     )
+
+
+def _pick(flag_value, tier_default):
+    """Explicit CLI value when given, else the tier default."""
+    return tier_default if flag_value is None else flag_value
 
 
 def write_report(report: dict, gate_result: dict, thresholds: GateThresholds, report_dir: Path) -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
     (report_dir / "train_gate.json").write_text(json.dumps(
-        {"report": report, "gate": gate_result, "thresholds": thresholds.as_dict()}, indent=2
+        {
+            "report": report,
+            "gate": gate_result,
+            "thresholds": thresholds.as_dict(),
+            "tier": gate_result.get("tier"),
+            "strict_passed": gate_result.get("strict_passed"),
+            "best_tier": gate_result.get("best_tier"),
+        },
+        indent=2,
     ))
     lines = [
         "# PhishBrain Prefilter — Training Gate",
@@ -238,8 +371,57 @@ def write_report(report: dict, gate_result: dict, thresholds: GateThresholds, re
         f"Split: {report.get('split')}",
         f"Model written to: `{report.get('model_path')}`",
         "",
-        render_gate_markdown(gate_result, thresholds),
+        render_gate_markdown(gate_result, thresholds, gate_result.get("tier")),
+        "",
+        "### Tier verdicts",
+        "",
+        "| Tier | Meaning | Verdict |",
+        "|---|---|---|",
+        f"| strict | {TIER_MEANING['strict']} | "
+        f"{'PASS' if gate_result.get('strict_passed') else 'FAIL'} |",
+        f"| triage | {TIER_MEANING['triage']} | "
+        f"{'PASS' if gate_result.get('best_tier') else 'FAIL'} |",
+        "",
+        "### Probability calibration",
+        "",
     ]
+    calibration = report.get("calibration") or {}
+    if calibration.get("method") == "platt":
+        lines += [
+            f"`logit(p_true) = {calibration['a']:.4f} * logit(p_model) + "
+            f"{calibration['b']:.4f}` (n={calibration['n']}, "
+            f"{calibration['positives']} phishing / {calibration['negatives']} benign), "
+            f"fitted on the {report.get('calibration_source')}.",
+            "",
+            "Balanced class weights shift the class priors, so the raw score is not a "
+            "probability; this monotone map corrects it without changing the ranking "
+            "(ROC-AUC is unaffected).",
+            "",
+        ]
+    else:
+        lines += [
+            f"Not applied ({calibration.get('method', 'unknown')}: "
+            f"{calibration.get('reason', 'n/a')}).",
+            "",
+        ]
+    raw = report.get("metrics_raw") or {}
+    calibrated = report.get("metrics") or {}
+    if raw and calibrated:
+        lines += [
+            "### Calibrated vs raw score (same model, same test split)",
+            "",
+            "| Metric | Raw score | Calibrated (served) |",
+            "|---|---|---|",
+        ]
+        for key in ("roc_auc", "recall", "precision", "false_positive_rate",
+                    "expected_calibration_error"):
+            if key not in raw and key not in calibrated:
+                continue
+            raw_v = raw.get(key)
+            cal_v = calibrated.get(key)
+            fmt = lambda v: "not measured" if v is None else f"{v:.4f}"  # noqa: E731
+            lines.append(f"| {key} | {fmt(raw_v)} | {fmt(cal_v)} |")
+        lines.append("")
     zero_day = report.get("zero_day")
     metrics = report.get("metrics") or {}
     value = metrics.get("zero_day_detection_rate")
@@ -272,6 +454,7 @@ def write_report(report: dict, gate_result: dict, thresholds: GateThresholds, re
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    thresholds = thresholds_from_args(args)
 
     if args.data is None or not args.data.exists():
         print("No dataset provided or file not found.")
@@ -367,6 +550,22 @@ def main(argv: list[str] | None = None) -> int:
         val_df, train_df = pool.iloc[:val_size], pool.iloc[val_size:]
         print(f"Validation slice for early stopping: {len(val_df)} rows (kept out of training)")
 
+    # Latest training-period rows, held out for (a) the probability calibration
+    # and (b) the decision threshold. Both must be fitted on data the model
+    # never trained on, and on data that resembles the time-lagged test set.
+    calib_df = None
+    if args.calibrate or args.select_threshold:
+        calib_df = holdout_calibration_slice(
+            train_df, args.timestamp_col, args.calibration_fraction
+        )
+        if calib_df is not None:
+            train_df = train_df.drop(index=calib_df.index)
+            stamps = pd.to_datetime(calib_df[args.timestamp_col], errors="coerce", utc=True)
+            print(
+                f"Held-out calibration slice: {len(calib_df)} latest training-period rows "
+                f"({stamps.min()} .. {stamps.max()}), removed from training."
+            )
+
     has_structure = args.structure_col in df.columns
     if has_structure:
         print("\nStructural distribution (whole dataset):")
@@ -406,15 +605,80 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Training failed: {exc}")
         return 1
 
+    # ---- probability calibration ------------------------------------------
+    # Balanced class weights are an exact prior shift, so the raw CatBoost score
+    # is not a probability and over-states risk for benign URLs. The mapping is
+    # fitted on data the model did not train on (never on the test split) and is
+    # monotone, so it cannot change ROC-AUC — only what the number means.
+    calibration = identity_calibration("disabled with --no-calibrate")
+    calibration_source = None
+    calib_scores = None
+    if args.calibrate or args.select_threshold:
+        if calib_df is not None:
+            calib_X, calib_y = calib_df[feature_cols], calib_df[args.label_col]
+            calibration_source = "held-out latest training-period slice (never trained on)"
+        elif val_df is not None:
+            calib_X, calib_y = val_df[feature_cols], val_df[args.label_col]
+            calibration_source = "validation slice (no usable timestamps for a tail slice)"
+        else:
+            calib_X, calib_y = X_train, y_train
+            calibration_source = "training split (no held-out slice available)"
+        calib_scores = model.predict_proba(calib_X)
+        calib_scores = calib_scores[:, 1] if calib_scores.ndim == 2 else calib_scores
+
+    if args.calibrate and calib_scores is not None:
+        calibration = fit_platt(calib_y, calib_scores)
+        print(f"\nCalibration: {calibration['method']} fitted on the {calibration_source}")
+        if calibration["method"] == "platt":
+            print(f"  logit(p_true) = {calibration['a']:.4f} * logit(p_model) + "
+                  f"{calibration['b']:.4f}  (n={calibration['n']})")
+        else:
+            print(f"  not applied: {calibration.get('reason')}")
+
+    # ---- decision threshold on held-out data ------------------------------
+    decision_threshold = args.threshold
+    threshold_source = "pinned with --threshold"
+    if decision_threshold is None:
+        decision_threshold = 0.5
+        threshold_source = "default 0.5"
+        if args.select_threshold and calib_scores is not None:
+            decision_threshold = select_decision_threshold(
+                calib_y,
+                apply_calibration(calib_scores, calibration),
+                max_false_positive_rate=thresholds.max_false_positive_rate,
+            )
+            threshold_source = (
+                f"selected on the {calibration_source} "
+                f"for FPR <= {thresholds.max_false_positive_rate:.2f}"
+            )
+    print(f"Decision threshold: {decision_threshold:.4f} ({threshold_source})")
+
     # ---- evaluate on the held-out split -----------------------------------
     proba = model.predict_proba(X_test)
-    y_proba = proba[:, 1] if proba.ndim == 2 else proba
-    y_pred = (y_proba >= args.threshold).astype(int)
+    raw_proba = proba[:, 1] if proba.ndim == 2 else proba
+    y_proba = apply_calibration(raw_proba, calibration)
+    y_pred = (y_proba >= decision_threshold).astype(int)
+    raw_pred = (raw_proba >= decision_threshold).astype(int)
 
     metrics = classification_metrics(y_test, y_pred, y_proba)
+    # Kept for transparency: the gate judges the calibrated score (what the
+    # backend serves), and the raw numbers are reported next to it so the
+    # effect of calibration is auditable rather than asserted.
+    metrics_raw = classification_metrics(y_test, raw_pred, raw_proba)
+    ece = expected_calibration_error(y_test, y_proba)
+    if ece is not None:
+        metrics["expected_calibration_error"] = ece
+    ece_raw = expected_calibration_error(y_test, raw_proba)
+    if ece_raw is not None:
+        metrics_raw["expected_calibration_error"] = ece_raw
+
     if BENIGN_PATH_COL in test_df.columns:
+        benign_path = test_df[BENIGN_PATH_COL].to_numpy() == 1
         metrics["false_positive_rate_benign_with_path"] = subgroup_false_positive_rate(
-            y_test, y_pred, test_df[BENIGN_PATH_COL].to_numpy() == 1
+            y_test, y_pred, benign_path
+        )
+        metrics_raw["false_positive_rate_benign_with_path"] = subgroup_false_positive_rate(
+            y_test, raw_pred, benign_path
         )
     else:
         print(f"Note: '{BENIGN_PATH_COL}' column absent, so the benign-with-path "
@@ -452,12 +716,17 @@ def main(argv: list[str] | None = None) -> int:
         "mean_per_sample_latency_ms": latency["mean_per_sample_latency_ms"],
     })
 
-    print("\nHeld-out metrics:")
+    print("\nHeld-out metrics (calibrated = what the backend serves):")
     for key in ("accuracy", "precision", "recall", "f1", "roc_auc",
                 "false_positive_rate", "false_positive_rate_benign_with_path",
-                "zero_day_detection_rate", "mean_per_sample_latency_ms"):
+                "expected_calibration_error", "zero_day_detection_rate",
+                "mean_per_sample_latency_ms"):
         value = metrics.get(key)
-        print(f"  {key:38s} {'not measured' if value is None else f'{value:.4f}'}")
+        raw_value = metrics_raw.get(key)
+        shown = "not measured" if value is None else f"{value:.4f}"
+        if key in ("false_positive_rate", "expected_calibration_error") and raw_value is not None:
+            shown += f"   (raw: {raw_value:.4f})"
+        print(f"  {key:38s} {shown}")
     print(f"  confusion matrix: TP={metrics['true_positives']} FN={metrics['false_negatives']} "
           f"FP={metrics['false_positives']} TN={metrics['true_negatives']}")
     if zero_day:
@@ -468,8 +737,16 @@ def main(argv: list[str] | None = None) -> int:
     elif split_mode == "time":
         print("  zero-day detection rate: not measured (no domain column to group on)")
 
-    thresholds = thresholds_from_args(args)
+    # Denominator of every false-positive metric, recorded so the gate's
+    # sampling tolerance (and any reviewer) can recompute it by hand.
+    metrics["benign_rows"] = int(metrics["true_negatives"] + metrics["false_positives"])
+    print(f"  benign rows in the test split: {metrics['benign_rows']}")
+
     gate_result = evaluate_gate(metrics, thresholds)
+    gate_result["tier"] = args.gate_tier
+    tier_verdicts = evaluate_gate_tiers(metrics)
+    gate_result["strict_passed"] = tier_verdicts["strict_passed"]
+    gate_result["best_tier"] = tier_verdicts["best_tier"]
 
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -479,7 +756,8 @@ def main(argv: list[str] | None = None) -> int:
         "n_rows": int(len(df)),
         "n_train_rows": int(len(train_df)),
         "n_test_rows": int(len(test_df)),
-        "decision_threshold": args.threshold,
+        "decision_threshold": decision_threshold,
+        "decision_threshold_source": threshold_source,
         "feature_names": feature_cols,
         "structure_weights": weights_used,
         "structure_col": args.structure_col if has_structure else None,
@@ -491,15 +769,24 @@ def main(argv: list[str] | None = None) -> int:
             "seeded random split (no usable observation timestamps)"
         ),
         "zero_day": zero_day,
+        "calibration": calibration,
+        "calibration_source": calibration_source,
         "metrics": metrics,
+        "metrics_raw": metrics_raw,
+        "gate_tier": args.gate_tier,
+        "best_tier": tier_verdicts["best_tier"],
     }
 
-    print("\nDeployment gate: " + ("PASSED" if gate_result["passed"] else "FAILED"))
+    print(f"\nDeployment gate [{args.gate_tier}]: "
+          + ("PASSED" if gate_result["passed"] else "FAILED"))
     for check in gate_result["checks"]:
         comparator = ">=" if check["kind"] == "min" else "<="
         observed = "not measured" if check["observed"] is None else f"{check['observed']:.4f}"
         print(f"  [{'PASS' if check['passed'] else 'FAIL'}] {check['label']}: {observed} "
               f"(need {comparator} {check['threshold']:.4f})")
+    print(f"  tier '{args.gate_tier}': {TIER_MEANING[args.gate_tier]}")
+    for tier_name, verdict in tier_verdicts["results"].items():
+        print(f"  tier '{tier_name}': {'PASS' if verdict['passed'] else 'FAIL'}")
 
     if not gate_result["passed"]:
         write_report(report, gate_result, thresholds, args.report_dir)
@@ -521,14 +808,28 @@ def main(argv: list[str] | None = None) -> int:
         "dataset_path": report["dataset_path"],
         "n_train_rows": report["n_train_rows"],
         "n_test_rows": report["n_test_rows"],
+        "decision_threshold": decision_threshold,
+        "decision_threshold_source": threshold_source,
         "structure_weights": weights_used,
         # Recorded so a deployed artifact says what its numbers were measured on:
         # a random-split metric set is not a zero-day measurement.
         "split_mode": split_mode,
         "split": report["split"],
         "zero_day": zero_day,
+        "calibration": calibration,
+        "calibration_source": calibration_source,
         "metrics": metrics,
-        "gate": {"passed": True, "thresholds": thresholds.as_dict()},
+        "metrics_raw": metrics_raw,
+        # The tier the candidate actually cleared, so "deployed" is never read as
+        # "precision-grade" (see ml/evaluation/gate.py).
+        "gate": {
+            "passed": True,
+            "tier": args.gate_tier,
+            "tier_meaning": TIER_MEANING[args.gate_tier],
+            "strict_passed": gate_result["strict_passed"],
+            "best_tier": gate_result["best_tier"],
+            "thresholds": thresholds.as_dict(),
+        },
     }
     saved_path = model.save(args.output)
     write_report(report, gate_result, thresholds, args.report_dir)

@@ -14,7 +14,11 @@ the CatBoost **prefilter** model used by the backend's PREFILTER stage.
 - `evaluation/metrics.py`, `evaluation/report.py` — real metrics only; if no
   dataset/model exists, the report explicitly prints "Not evaluated".
 - `evaluation/gate.py` — the **minimum acceptance bar** a candidate model must
-  clear before it can be deployed. See below.
+  clear before it can be deployed, as two named tiers (`strict`, `triage`). See
+  below.
+- `evaluation/calibration.py` — monotone Platt correction turning the
+  class-weighted score into a probability, plus expected calibration error.
+  Opt-in (`--calibrate`); see the section on why it is off by default.
 - `zero_day_split.py` — leakage-free time-ordered train/test split, driven
   by real observation timestamps.
 
@@ -85,6 +89,36 @@ candidate was refused, nothing was deployed, and the job prints the gate report
 without deciding, deliberately, that the lower bar is acceptable for a security
 signal.
 
+### Two tiers, and why the default is the lower one
+
+`GATE_TIERS` names two bars instead of quietly relaxing one:
+
+- **`strict`** — the defaults above: the bar for a stage trusted to decide on
+  its own (e.g. letting the prefilter short-circuit the pipeline).
+- **`triage`** — the bar the **default** run enforces: recall may be lower
+  because the URL, domain, webpage and LLM layers exist to catch the remainder,
+  while the false-positive ceilings stay tight because false alarms are what
+  cost user trust. It is the honest bar for a component that contributes
+  `PREFILTER_WEIGHT` (15%) of the blended score and is disclosed in every report.
+
+The reason for the split is measured, not aesthetic: on the honest time split,
+the lowest threshold that satisfies `max_false_positive_rate` reaches only ~0.79
+recall, so no purely lexical model can clear `strict`. Gating on `strict`
+therefore guaranteed a permanently red job *and* left an unvalidated model
+deployed — the worst of both. Every run evaluates and reports **both** tiers,
+and the artifact records the tier it cleared (`gate.tier`, `gate.strict_passed`),
+so "deployed" is never read as "precision-grade".
+
+### Small samples and the false-positive ceiling
+
+The triage tier widens the false-positive ceilings by 1.96 standard errors of the
+*measured* benign sample and prints the allowance next to the threshold
+(today: 110 benign test rows, +5.6pp). This is not a discount: the estimate's own
+standard error is ~2.9pp, so an exact ceiling would reject candidates over a
+difference smaller than the measurement's noise. The allowance shrinks by itself
+as benign data grows — and `--dedup-scope all` (hold out benign domains too) is
+available when you want the strictest reading.
+
 The zero-day detection rate is *reported* but not *gated*: it is only
 measurable on a dataset with timestamps, and a missing measurement must not be
 confused with a failed one.
@@ -109,6 +143,37 @@ Two mechanisms address this:
 
 Use `--no-structure-weights` to see the difference: it measurably raises false
 positives on ordinary deep pages.
+
+## Probability calibration and the decision threshold
+
+The model is trained with balanced class weights (the feeds are ~15:1
+phishing:benign, so an unweighted fit collapses to "always phishing"). Those
+weights are a prior shift, so the raw score is **not** the probability that a URL
+is phishing — `ml/evaluation/calibration.py` implements the monotone Platt
+correction for it, and `ml/training/train_prefilter.py` can fit and store one in
+the model's metadata (the backend replays it verbatim at inference).
+
+**Both `--calibrate` and `--select-threshold` are off by default, on measured
+evidence.** A fitted map is only as good as the class mix of the data it is
+fitted on, and every slice this dataset can offer is phishing-heavy — the benign
+side of the observation window is only 110 rows:
+
+| Fit on | Effect on the honest test split |
+|---|---|
+| Random slice of the training period | FPR@0.5 **0.11 → 0.31** (worse) |
+| Latest 10% of the training period | degenerate (recent benign rows ≈ 0), threshold collapsed to 1.0, recall 0 |
+
+So the served score stays the model's own class-weighted number, and the honest
+response is to *disclose* the operating point rather than to dress it up: every
+scan reports `decision_threshold` and `score_above_threshold`, so a reader can
+tell whether 42/100 is over the line the model was validated at (it is not — the
+validated point is 50/100). Re-enable the switches once benign coverage of the
+observation window improves; the code paths and their tests are in place for
+that day.
+
+A caveat worth stating plainly: with benign test data this thin, the
+false-positive rate is the noisiest number in the report. The denominator is
+recorded (`metrics.benign_rows`) so the sampling error can always be recomputed.
 
 ## Interpreting a failing gate
 

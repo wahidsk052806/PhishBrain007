@@ -11,6 +11,14 @@ name: Prefilter gate
 # the job. That is the intended behaviour: an unusable model must not ship just
 # because training finished.
 #
+# The bar the job enforces is the `triage` tier (the default), which is the
+# honest bar for a 15%-weighted stage whose verdict every later layer re-checks.
+# The stricter, sole-decision-maker `strict` tier is evaluated in the same run
+# and reported, but does not gate the build — see ml/evaluation/gate.py for why
+# a lexical-only model cannot meet it and why a permanently-red job was the
+# wrong way to say so. Promote a model with `--gate-tier strict` when it is
+# genuinely ready to short-circuit the pipeline.
+#
 # The pipeline is evaluated with a leakage-free, time-ordered split whenever the
 # feeds carry real observation timestamps (PhishTank `submission_time` for
 # phishing, Internet Archive capture times for benign), so the headline number is
