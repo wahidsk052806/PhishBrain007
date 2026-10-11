@@ -1,6 +1,7 @@
 """Repository layer: persistence for analyses and feedback."""
 from __future__ import annotations
 
+import copy
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -107,6 +108,93 @@ def save_feedback(analysis_id: str, correct: bool, comment: str | None) -> None:
             session.add(FeedbackRecord(analysis_id=analysis_id, correct=correct, comment=comment))
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to persist feedback", extra={"extra_fields": {"error": str(exc)}})
+
+
+# The key a stored evidence image lives under. It appears in a layer's
+# `details` (the backend pipeline attaches it there) and, for results the
+# dashboard/extension normalise, in the layer's `evidence`.
+_SCREENSHOT_KEY = "screenshot_data_url"
+
+
+def _without_screenshot_evidence(payload: object) -> object | None:
+    """Return `payload` with every screenshot data URL removed, or None if clean.
+
+    A *copy* is returned rather than mutating in place: `result_json` is a plain
+    SQLAlchemy JSON column, which does not track in-place mutation, so an edited
+    dict would never be flushed. Returning None when there was nothing to strip
+    lets the caller skip the write (and avoids rewriting every clean record on
+    each sweep).
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    found = False
+
+    def _strip(container: object) -> None:
+        nonlocal found
+        if isinstance(container, dict) and container.pop(_SCREENSHOT_KEY, None) is not None:
+            found = True
+
+    for layer in payload.get("layer_evidence") or []:
+        if isinstance(layer, dict):
+            _strip(layer.get("details"))
+            _strip(layer.get("evidence"))
+    # Defensive: some callers serialise a keyed `layers` record instead.
+    layers = payload.get("layers")
+    if isinstance(layers, dict):
+        for layer in layers.values():
+            if isinstance(layer, dict):
+                _strip(layer.get("details"))
+                _strip(layer.get("evidence"))
+    _strip(payload.get("visual"))
+
+    if not found:
+        return None
+    return payload
+
+
+def _strip_screenshot_evidence(cutoff: datetime | None) -> int:
+    """Strip stored screenshot evidence from records older than `cutoff`.
+
+    `cutoff=None` means every record. Returns the number of records changed.
+    """
+    try:
+        with session_scope() as session:
+            stmt = select(AnalysisRecord)
+            if cutoff is not None:
+                stmt = stmt.where(AnalysisRecord.created_at < cutoff)
+            records = session.execute(stmt).scalars().all()
+            changed = 0
+            for record in records:
+                # Copy first: the strip must not touch the identity-mapped dict
+                # before we know whether anything was removed.
+                candidate = _without_screenshot_evidence(copy.deepcopy(record.result_json))
+                if candidate is None:
+                    continue
+                record.result_json = candidate
+                changed += 1
+            return changed
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to purge screenshot evidence", extra={"extra_fields": {"error": str(exc)}})
+        return 0
+
+
+def purge_visual_evidence(days: int | None = None) -> int:
+    """Delete stored screenshot thumbnails older than the retention window.
+
+    Runs on its own (shorter) clock than `purge_expired`: the analysis record
+    keeps its score and indicators, only the image is dropped. Safe to call
+    repeatedly — a sweep with nothing to do writes nothing.
+    """
+    settings = get_settings()
+    window = settings.VISUAL_RETENTION_DAYS if days is None else max(0, days)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window)
+    return _strip_screenshot_evidence(cutoff)
+
+
+def clear_visual_evidence() -> int:
+    """Strip every stored screenshot thumbnail immediately ("clear all")."""
+    return _strip_screenshot_evidence(cutoff=None)
 
 
 def purge_expired() -> int:

@@ -1,6 +1,7 @@
 """FastAPI application entrypoint for PhishBrain."""
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -11,7 +12,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.api.v1.routes import router as v1_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
+from app.db.repository import purge_expired, purge_visual_evidence
 from app.db.session import init_db
+from app.llm.ollama_client import warm_up_ollama
+from app.ml.prefilter import get_prefilter
 
 configure_logging()
 logger = get_logger(__name__)
@@ -41,8 +45,69 @@ class MaxBodySizeMiddleware(BaseHTTPMiddleware):
 async def lifespan(app: FastAPI):
     init_db()
     logger.info("PhishBrain backend starting up")
-    yield
-    logger.info("PhishBrain backend shutting down")
+    # Background warm-ups. Neither is allowed to delay startup or to fail it:
+    # the model loads and the LLM warms while the process is already serving.
+    warmups = asyncio.create_task(_warm_up())
+    # Retention was configured but never enforced: `purge_expired` existed and
+    # was never called from anywhere, so RETENTION_DAYS only ever described an
+    # intention. The loop now actually applies both policies.
+    retention = asyncio.create_task(_retention_loop())
+    try:
+        yield
+    finally:
+        warmups.cancel()
+        retention.cancel()
+        logger.info("PhishBrain backend shutting down")
+
+
+async def _retention_loop() -> None:
+    """Apply the analysis and screenshot-evidence retention policies.
+
+    Runs once at startup and then on the configured interval. Both sweeps are
+    blocking DB work, so they run in a worker thread and never touch startup or
+    a request's latency.
+    """
+    settings = get_settings()
+    interval = max(1, settings.VISUAL_PURGE_INTERVAL_MINUTES) * 60
+    while True:
+        try:
+            expired = await asyncio.to_thread(purge_expired)
+            if expired:
+                logger.info("Purged expired analyses", extra={"extra_fields": {"count": expired}})
+            if settings.VISUAL_AUTO_PURGE_ENABLED:
+                stripped = await asyncio.to_thread(purge_visual_evidence)
+                if stripped:
+                    logger.info(
+                        "Purged aged screenshot evidence",
+                        extra={
+                            "extra_fields": {
+                                "count": stripped,
+                                "retention_days": settings.VISUAL_RETENTION_DAYS,
+                            }
+                        },
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Retention sweep failed", extra={"extra_fields": {"error": str(exc)}})
+        await asyncio.sleep(interval)
+
+
+async def _warm_up() -> None:
+    """Preload the prefilter model and the LLM so the first scan is not slow.
+
+    Measured on this machine: without the LLM warm-up the first scan after a
+    restart took 73.8 s against 37-43 s for the next ones, because llama3.2 had
+    to be paged in mid-request.
+    """
+    settings = get_settings()
+    try:
+        # CatBoost load is CPU-bound and blocking, so keep it off the event loop.
+        await asyncio.to_thread(get_prefilter)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Prefilter warm-up failed", extra={"extra_fields": {"error": str(exc)}})
+    if settings.LLM_WARMUP_ON_STARTUP:
+        await warm_up_ollama(settings)
 
 
 def create_app() -> FastAPI:

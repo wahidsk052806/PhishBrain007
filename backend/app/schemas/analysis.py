@@ -113,6 +113,21 @@ class PrefilterEvidence(BaseModel):
     # Score the multi-layer engine produced before the prefilter was blended in,
     # so the contribution (`score` at `weight`) can be read off directly.
     layer_score: Optional[float] = Field(default=None, ge=0, le=100)
+    # The model's own class-weighted probability, before calibration. Kept so a
+    # reviewer can see exactly how much the calibration moved the number.
+    raw_score: Optional[float] = Field(default=None, ge=0, le=100)
+    calibrated: bool = False
+    # What the deployed artifact claims about itself: the gate tier it cleared
+    # (see ml/evaluation/gate.py) and where its metrics were measured. A
+    # prefilter that never passed its own bar must not be presented as validated.
+    gate_tier: Optional[str] = None
+    gate_passed: Optional[bool] = None
+    split: Optional[str] = None
+    trained_at: Optional[str] = None
+    # The operating point the model was validated at (probability space). A
+    # score below it is not "suspicious" no matter how large the number looks.
+    decision_threshold: Optional[float] = Field(default=None, ge=0, le=1)
+    score_above_threshold: Optional[bool] = None
 
 
 SOCEvent.model_rebuild()
@@ -155,6 +170,11 @@ class HealthStatus(BaseModel):
     database: str
     cache: str
     app_env: str
+    # Which implementation is actually in use. "database: ok" on SQLite and
+    # "database: ok" on Postgres looked identical while being very different
+    # deployments, and the same was true of the in-memory cache versus Valkey.
+    database_backend: str = Field(default="unknown")
+    cache_backend: str = Field(default="unknown")
 
 
 class ConfigResponse(BaseModel):
@@ -168,3 +188,7 @@ class ConfigResponse(BaseModel):
     allowed_schemes: list[str]
     store_raw_email: bool
     retention_days: int
+    # How long stored screenshot evidence is kept before the automatic sweep
+    # drops it — separate from (and normally shorter than) `retention_days`,
+    # because the image of a visited page is more sensitive than its verdict.
+    visual_retention_days: int

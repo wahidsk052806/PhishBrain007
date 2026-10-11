@@ -119,6 +119,55 @@ def _load_brand_favicons() -> dict[str, list[str]]:
     return _normalize_references(section) if isinstance(section, dict) else {}
 
 
+def _to_wireframe(img):
+    """Edge-only rendering of a screenshot: layout without content.
+
+    Colour is discarded and only strong intensity gradients survive, so a
+    reviewer can see the page's *structure* (where the logo, fields and buttons
+    sit) without the screenshot being a readable copy of the page. That is the
+    point of the wireframe mode: show the evidence, keep nothing worth leaking.
+    """
+    from PIL import ImageFilter, ImageOps
+
+    edges = ImageOps.grayscale(img).filter(ImageFilter.FIND_EDGES)
+    return edges.point(lambda p: 0 if p > 28 else 255, mode="L").convert("RGB")
+
+
+def _thumbnail_data_url(image_bytes: bytes) -> str | None:
+    """Downscaled data URL of the captured screenshot, per the configured mode.
+
+    Returns None when mode is "off" or no imaging library is available — the
+    report then simply omits the image rather than breaking the scan.
+    """
+    settings = get_settings()
+    mode = settings.VISUAL_SCREENSHOT_MODE
+    if mode == "off":
+        return None
+    try:
+        from PIL import Image
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:  # noqa: BLE001
+        return None
+
+    max_width = max(64, int(settings.VISUAL_SCREENSHOT_MAX_WIDTH))
+    if img.width > max_width:
+        ratio = max_width / img.width
+        img = img.resize((max_width, max(1, round(img.height * ratio))), Image.LANCZOS)
+
+    buffer = io.BytesIO()
+    if mode == "wireframe":
+        _to_wireframe(img).save(buffer, format="PNG", optimize=True)
+        mime = "image/png"
+    else:
+        img.save(buffer, format="JPEG", quality=70, optimize=True)
+        mime = "image/jpeg"
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
 def _phash_from_bytes(image_bytes: bytes):
     try:
         import imagehash
@@ -486,6 +535,7 @@ async def analyze_visual(
                     "hash_distance": None,
                     "visually_similar": False,
                     "screenshot_reason": f"screenshot capture unavailable: {exc.reason}",
+                    "screenshot_data_url": None,
                     "icon": icon,
                 }
             return {
@@ -497,16 +547,22 @@ async def analyze_visual(
     if image_bytes is None:
         return {"status": "unavailable", "reason": "screenshot capture produced no image", "icon": icon}
 
+    # The evidence image, downscaled and rendered per the configured mode. It is
+    # computed once here and attached to every return path below so a caller
+    # never has to guess whether a screenshot existed.
+    thumbnail = _thumbnail_data_url(image_bytes)
+
     shot = compare_against_references(image_bytes)
     if shot.get("status") != "ok":
         if icon.get("matched"):
-            return {"status": "ok", "closest_brand": icon["closest_brand"], "icon": icon, **{
+            return {"status": "ok", "closest_brand": icon["closest_brand"], "icon": icon, "screenshot_data_url": thumbnail, **{
                 k: shot.get(k) for k in ("phash", "hash_distance")
             }}
-        return {**shot, "icon": icon}
+        return {**shot, "icon": icon, "screenshot_data_url": thumbnail}
 
     # Prefer the icon verdict: it is the one with real separating power.
     if icon.get("matched"):
         shot["closest_brand"] = icon["closest_brand"]
     shot["icon"] = icon
+    shot["screenshot_data_url"] = thumbnail
     return shot

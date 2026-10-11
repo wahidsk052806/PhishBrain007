@@ -64,6 +64,41 @@ async def get_llm_assessment(
     return _deterministic_fallback_assessment(deterministic_evidence), True
 
 
+async def warm_up_ollama(settings) -> bool:
+    """Load the model into memory before the first scan needs it.
+
+    Loading llama3.2 from disk costs ~30 s of CPU, and without this the first
+    scan after a restart paid for it (measured: 73.8 s first scan vs 37-43 s
+    warm). Deliberately small and best-effort — a missing Ollama must not stop
+    the backend from starting, it just means the LLM layer degrades on the first
+    request as it always did.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=settings.ANALYSIS_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate",
+                json={
+                    "model": settings.OLLAMA_MODEL,
+                    "prompt": "ok",
+                    "stream": False,
+                    "keep_alive": settings.LLM_KEEP_ALIVE,
+                    # One token: the point is the load, not the completion.
+                    "options": {"num_predict": 1},
+                },
+            )
+            if resp.status_code != 200:
+                logger.info(
+                    "Ollama warm-up skipped",
+                    extra={"extra_fields": {"status": resp.status_code}},
+                )
+                return False
+            logger.info("Ollama model warm", extra={"extra_fields": {"model": settings.OLLAMA_MODEL}})
+            return True
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Ollama warm-up failed", extra={"extra_fields": {"error": str(exc)}})
+        return False
+
+
 async def _call_ollama(prompt: str, settings) -> str | None:
     try:
         async with httpx.AsyncClient(timeout=settings.ANALYSIS_TIMEOUT_SECONDS) as client:

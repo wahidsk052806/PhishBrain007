@@ -54,7 +54,11 @@ async def fetch_page(url: str, timeout: float, max_bytes: int) -> tuple[str | No
 
     try:
         async with httpx.AsyncClient(
-            timeout=timeout,
+            # Connect gets its own, shorter budget. A host that is unreachable
+            # (firewalled, geo-blocked, off) does not answer a SYN at all, and
+            # letting the *whole* layer timeout be the connect timeout meant a
+            # dead host cost 20s+ before the scan could say so.
+            timeout=httpx.Timeout(timeout, connect=min(8.0, timeout)),
             follow_redirects=True,
             max_redirects=3,
             headers=fetch_headers(),
@@ -78,8 +82,14 @@ async def fetch_page(url: str, timeout: float, max_bytes: int) -> tuple[str | No
                 body = b"".join(chunks)
                 return body.decode(resp.encoding or "utf-8", errors="replace"), degraded
     except Exception as exc:  # noqa: BLE001
+        # The failure *kind* is carried in the code so the report can explain
+        # what actually happened. "webpage.fetch_failed" alone sent a reader
+        # looking for a bug in the scanner when the real answer was "this host
+        # does not answer us", and it skipped the browser capture phase without
+        # saying why.
+        reason = type(exc).__name__
         logger.info("Page fetch failed", extra={"extra_fields": {"url": url, "error": str(exc)}})
-        degraded.append("webpage.fetch_failed")
+        degraded.append(f"webpage.fetch_failed:{reason}")
         return None, degraded
 
 
@@ -174,16 +184,34 @@ def analyze_html(html_content: str, page_url: str, brands: list[str] | None = No
     if icon_tag and icon_tag.get("href"):
         favicon = urljoin(page_url, icon_tag["href"])
 
+    # Impersonation is a *claim*, not a mention.
+    #
+    # This used to fire on any occurrence of a brand name anywhere in the HTML,
+    # which flagged every legitimate page that links to other companies:
+    # github.com/login was scored 48/100 SUSPICIOUS purely because its page
+    # mentions "google", "microsoft" and "amazon" — in its SSO buttons and
+    # footer links. A page impersonates a brand when it *presents itself* as
+    # that brand and asks for a secret: the brand name in the title or a
+    # heading, plus a credential-like field. Body mentions are recorded for
+    # transparency but no longer score on their own.
     brand_mentions = [b for b in brands if b in (html_content or "").lower()]
+    heading_text = " ".join(
+        tag.get_text(" ", strip=True) for tag in soup.find_all(["h1", "h2", "h3"])
+    ).lower()
+    title_lower = title.lower()
+    brands_claimed = [b for b in brands if b in title_lower or b in heading_text]
     brand_domain_mismatch = False
-    if brand_mentions and page_domain:
-        for b in brand_mentions:
+    if brands_claimed and credential_fields and page_domain:
+        for b in brands_claimed:
             if b not in page_domain.lower():
                 brand_domain_mismatch = True
                 break
     if brand_domain_mismatch:
         score += 20
-        indicators.append(f"Page mentions brand(s) {brand_mentions} but domain is '{page_domain}'")
+        indicators.append(
+            f"Page presents itself as {brands_claimed} (title/heading) and asks for credentials, "
+            f"but is served from '{page_domain}'"
+        )
 
     if parsed_page.scheme != "https":
         score += 6
@@ -197,6 +225,7 @@ def analyze_html(html_content: str, page_url: str, brands: list[str] | None = No
         "iframe_count": len(iframes),
         "meta_refresh": bool(meta_refresh),
         "brand_mentions": brand_mentions,
+        "brands_claimed": brands_claimed,
         "brand_domain_mismatch": brand_domain_mismatch,
         "page_domain": page_domain,
         "is_https": parsed_page.scheme == "https",
@@ -276,9 +305,20 @@ def build_llm_page_digest(html_content: str, page_url: str, max_chars: int = 120
     if text and text_budget:
         lines.append(f"visible_text: {text[:text_budget]}")
 
+    # Distinguish a brand the page *claims* to be from one it merely links to.
+    # Passing an undifferentiated mention list to the model invited it to read
+    # "links to google/microsoft" (an SSO button) as "pretends to be google".
     brands = [b for b in get_settings().brands if b in (html_content or "").lower()]
     if brands:
-        lines.append(f"brands_mentioned: {', '.join(brands)}")
+        heading_text = " ".join(
+            tag.get_text(" ", strip=True) for tag in soup.find_all(["h1", "h2", "h3"])
+        ).lower()
+        title_lower = (soup.title.get_text(strip=True) if soup.title else "").lower()
+        claimed = [b for b in brands if b in title_lower or b in heading_text]
+        if claimed:
+            lines.append(f"brands_claimed: {', '.join(claimed)}")
+        else:
+            lines.append(f"brand_mentions_in_body: {', '.join(brands)}")
 
     for img in soup.find_all("img")[:4]:
         alt = (img.get("alt") or "").strip()

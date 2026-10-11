@@ -113,12 +113,99 @@ def _is_private_ip(ip_str: str) -> bool:
     )
 
 
+# Schemes a human may legitimately paste that are *not* web targets. They are
+# left untouched so `validate_scheme` refuses them by name rather than the
+# normaliser silently rewriting `javascript:alert(1)` into a hostname and
+# attempting to scan it.
+NON_WEB_SCHEMES = (
+    "javascript",
+    "data",
+    "file",
+    "ftp",
+    "ftps",
+    "blob",
+    "about",
+    "chrome",
+    "mailto",
+    "tel",
+    "sms",
+    "ws",
+    "wss",
+    "view-source",
+)
+
+_MAX_TARGET_CHARS = 2048
+
+
+def normalize_url_input(raw: str) -> str:
+    """Turn what a person actually types into an absolute http(s) URL.
+
+    Nothing used to do this, so typing a bare host — `hianime.to` — reached the
+    SSRF guard as a scheme-less string and the scan was refused outright with
+    `Scheme '' is not allowed`. Rejecting `hianime.to` while accepting
+    `https://hianime.to` is not a security decision, it is an input-parsing
+    gap: every browser address bar, and every competing scanner, accepts the
+    host form. Normalising here means every caller (dashboard, extension,
+    curl) gets the same behaviour.
+
+    Rules, in order:
+      * `host[:port][/path...]`            -> `https://` + that
+      * `//host/path` (protocol-relative)   -> `https://host/path`
+      * `https:/host` / `http:/host` typos  -> `https://host`
+      * an explicit `http(s)://` URL        -> unchanged
+      * a known non-web scheme              -> unchanged, so the guard still
+        rejects it with a message naming the scheme
+
+    A pasted sentence ("scan example.com now") is reduced to the one token that
+    is shaped like a target, rather than blindly taking the first word: the
+    alternative was a confusing "host does not resolve" for a word that was
+    never a host.
+    """
+    if not isinstance(raw, str):
+        return ""
+    text = raw.strip().strip("<>").strip().strip('"').strip("'").strip()
+    if not text:
+        return ""
+    text = text[:_MAX_TARGET_CHARS]
+    tokens = text.split()
+    if len(tokens) > 1:
+        text = (
+            next((t for t in tokens if re.match(r"^(https?://|//)", t, re.IGNORECASE)), None)
+            or next((t for t in tokens if "." in t and not t.startswith(".")), None)
+            or tokens[0]
+        )
+
+    lowered = text.lower()
+    for scheme in NON_WEB_SCHEMES:
+        if lowered.startswith(f"{scheme}:"):
+            return text
+
+    explicit = re.match(r"^(https?):(/*)(.*)$", text, re.IGNORECASE)
+    if explicit:
+        scheme, slashes, rest = explicit.group(1).lower(), explicit.group(2), explicit.group(3)
+        if slashes == "//" and rest:
+            return f"{scheme}://{rest}"
+        # `https:/host`, `https:host` or a bare `https:` are all typos for a
+        # web URL; repair them instead of failing with no explanation.
+        if rest:
+            return f"{scheme}://{rest.lstrip('/')}"
+        return text
+
+    if text.startswith("//"):
+        return f"https:{text}"
+
+    return f"https://{text}"
+
+
 def validate_scheme(url: str) -> str:
     settings = get_settings()
     parsed = urlparse(url)
     scheme = (parsed.scheme or "").lower()
     if scheme not in settings.allowed_schemes:
-        raise SSRFBlockedError(f"Scheme '{scheme}' is not allowed")
+        raise SSRFBlockedError(
+            f"Scheme '{scheme}' is not allowed (this scanner only accepts "
+            f"{', '.join(settings.allowed_schemes)})"
+        )
     return scheme
 
 
@@ -164,6 +251,18 @@ def guard_url(url: str) -> ResolvedHost:
     """Full SSRF guard: validates scheme then resolves & checks host."""
     validate_scheme(url)
     return resolve_and_guard_host(url)
+
+
+def guard_user_target(raw: str) -> tuple[str, ResolvedHost]:
+    """Normalise a user-supplied target and guard it, returning both.
+
+    Callers must scan the *returned* URL, not the raw input: the normalised
+    form is what was validated and what the report will name as the target.
+    """
+    url = normalize_url_input(raw)
+    if not url:
+        raise SSRFBlockedError("No URL supplied")
+    return url, guard_url(url)
 
 
 def enforce_size_cap(data: bytes | str, max_bytes: int) -> None:

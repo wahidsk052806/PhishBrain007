@@ -10,12 +10,14 @@ from fastapi.responses import PlainTextResponse
 from app.cache.store import get_cache
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.core.security import SSRFBlockedError, guard_url
+from app.core.security import SSRFBlockedError, guard_user_target
 from app.db.repository import (
     clear_history,
+    clear_visual_evidence,
     get_analysis,
     list_alerts,
     list_history,
+    purge_visual_evidence,
     save_feedback,
 )
 from app.db.session import get_engine
@@ -44,19 +46,24 @@ async def analyze_url_endpoint(payload: URLAnalyzeRequest):
     try:
         if payload.demo:
             return build_demo_result("url", payload.url)
+        # A bare host (`hianime.to`) is a valid thing to type, so the target is
+        # normalised to an absolute URL before the SSRF guard sees it. The
+        # normalised form is what gets scanned and named in the report.
         try:
-            guard_url(payload.url)
+            target, _ = guard_user_target(payload.url)
         except SSRFBlockedError as exc:
             raise HTTPException(status_code=400, detail=f"URL rejected: {exc}") from exc
 
+        request_payload = payload.model_dump()
+        request_payload["url"] = target
         result = await run_analysis(
             "url",
-            payload.url,
-            url=payload.url,
+            target,
+            url=target,
             dom_summary=payload.dom_summary,
             fetch_page_flag=payload.fetch_page,
             skip_llm=not payload.use_llm,
-            raw_input=payload.model_dump(),
+            raw_input=request_payload,
         )
         return result
     except HTTPException:
@@ -89,22 +96,28 @@ async def analyze_page_endpoint(payload: PageAnalyzeRequest):
     try:
         if payload.demo:
             return build_demo_result("page", payload.url)
+        # A caller-supplied HTML body carries its own target; otherwise the
+        # URL is normalised exactly as the URL endpoint does, so a bare host
+        # works here too.
+        target = payload.url
         if not payload.html and payload.fetch_page:
             try:
-                guard_url(payload.url)
+                target, _ = guard_user_target(payload.url)
             except SSRFBlockedError as exc:
                 raise HTTPException(status_code=400, detail=f"URL rejected: {exc}") from exc
 
+        request_payload = payload.model_dump()
+        request_payload["url"] = target
         result = await run_analysis(
             "page",
-            payload.url,
-            url=payload.url,
+            target,
+            url=target,
             html=payload.html,
             dom_summary=payload.dom_summary,
             fetch_page_flag=payload.fetch_page,
             screenshot_base64=payload.screenshot_base64,
             skip_llm=not payload.use_llm,
-            raw_input=payload.model_dump(),
+            raw_input=request_payload,
         )
         return result
     except HTTPException:
@@ -147,6 +160,46 @@ async def history_clear_endpoint():
     try:
         removed = clear_history()
         return {"cleared": removed}
+    except Exception as exc:  # noqa: BLE001
+        raise _error_response(exc) from exc
+
+
+@router.get("/visual-evidence/policy")
+async def visual_evidence_policy_endpoint():
+    """The active screenshot-evidence retention policy.
+
+    Exposed so the dashboard can show the *real* configured window instead of
+    hard-coding one, and so an operator can confirm the sweep is enabled.
+    """
+    settings = get_settings()
+    return {
+        "retention_days": settings.VISUAL_RETENTION_DAYS,
+        "auto_purge_enabled": settings.VISUAL_AUTO_PURGE_ENABLED,
+        "screenshot_mode": settings.VISUAL_SCREENSHOT_MODE,
+    }
+
+
+@router.post("/visual-evidence/clear")
+async def visual_evidence_clear_endpoint():
+    """Strip every stored screenshot thumbnail now, keeping the analyses.
+
+    Deliberately not a delete of the analysis: a user clearing visual evidence
+    is asking to stop the images being stored, not to lose their history.
+    """
+    try:
+        cleared = clear_visual_evidence()
+        return {"cleared": cleared}
+    except Exception as exc:  # noqa: BLE001
+        raise _error_response(exc) from exc
+
+
+@router.post("/visual-evidence/purge-expired")
+async def visual_evidence_purge_endpoint():
+    """Run the aged-evidence sweep on demand (what the scheduler does)."""
+    try:
+        settings = get_settings()
+        purged = purge_visual_evidence()
+        return {"purged": purged, "retention_days": settings.VISUAL_RETENTION_DAYS}
     except Exception as exc:  # noqa: BLE001
         raise _error_response(exc) from exc
 
@@ -215,6 +268,8 @@ async def health_endpoint():
         database=db_status,
         cache=cache_status,
         app_env=settings.APP_ENV,
+        database_backend="postgres" if settings.DATABASE_URL.startswith("postgres") else "sqlite",
+        cache_backend=cache.backend,
     )
 
 
@@ -234,4 +289,5 @@ async def config_endpoint():
         allowed_schemes=settings.allowed_schemes,
         store_raw_email=settings.STORE_RAW_EMAIL,
         retention_days=settings.RETENTION_DAYS,
+        visual_retention_days=settings.VISUAL_RETENTION_DAYS,
     )

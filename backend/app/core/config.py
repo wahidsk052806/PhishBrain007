@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     # after its default idle window and the next scan pays a cold start that is
     # many times the inference cost itself.
     LLM_KEEP_ALIVE: str = Field(default="30m")
+    # Load the model into memory at startup instead of during the first scan.
+    # Loading costs ~30 s of CPU on a 4-core box, which the first request would
+    # otherwise pay for; set to false on a memory-constrained deployment where
+    # holding the model resident is not acceptable.
+    LLM_WARMUP_ON_STARTUP: bool = Field(default=True)
     # Ollama defaults to a large context; on CPU a 4k window is markedly faster
     # and is ample for a URL plus a capped page summary.
     LLM_NUM_CTX: int = Field(default=4096, ge=512)
@@ -67,6 +72,18 @@ class Settings(BaseSettings):
     STORE_RAW_EMAIL: bool = Field(default=False)
     RETENTION_DAYS: int = Field(default=30)
 
+    # Screenshot evidence is the most sensitive thing this backend stores — a
+    # picture of the page a user visited — so it is purged on its own, much
+    # shorter clock than the analysis record itself. The analysis (score,
+    # indicators, evidence) survives under RETENTION_DAYS; only the image is
+    # dropped. A value of 0 means "store none at all": every sweep strips the
+    # screenshots immediately, which is the right setting for a shared box.
+    VISUAL_RETENTION_DAYS: int = Field(default=7, ge=0)
+    # How often the background sweep runs. The sweep is cheap (it only looks at
+    # records older than the cutoff) and idempotent, so a coarse interval is
+    # fine; it also runs once at startup so a restart enforces the policy.
+    VISUAL_PURGE_INTERVAL_MINUTES: int = Field(default=360, ge=1)
+
     BRAND_LIST: str = Field(default=",".join(DEFAULT_BRANDS))
     ALLOWED_SCHEMES: str = Field(default=",".join(DEFAULT_SCHEMES))
 
@@ -89,10 +106,29 @@ class Settings(BaseSettings):
     )
     FETCH_ACCEPT_LANGUAGE: str = Field(default="en-US,en;q=0.9")
 
+    # Whether the visual layer hands the captured screenshot back for display,
+    # and in what form. "off" keeps the pixels on the server; "pixels" returns a
+    # downscaled JPEG evidence image; "wireframe" returns an edge-only rendering
+    # that preserves the layout while dropping colour and legible text, so the
+    # dashboard can SHOW what it compared without storing the page itself.
+    VISUAL_SCREENSHOT_MODE: str = Field(default="pixels")
+    VISUAL_SCREENSHOT_MAX_WIDTH: int = Field(default=480)
+    # Set to false to disable the automatic screenshot-evidence sweep entirely
+    # (the retention policy then only runs when an operator calls it).
+    VISUAL_AUTO_PURGE_ENABLED: bool = Field(default=True)
+
     @field_validator("APP_ENV")
     @classmethod
     def _lower_env(cls, v: str) -> str:
         return v.lower()
+
+    @field_validator("VISUAL_SCREENSHOT_MODE")
+    @classmethod
+    def _valid_screenshot_mode(cls, v: str) -> str:
+        mode = (v or "off").lower()
+        # An unrecognised value is a misconfiguration, and the safe reading is
+        # "off" — never silently ship page pixels when the intent was wireframe.
+        return mode if mode in {"off", "pixels", "wireframe"} else "off"
 
     @property
     def brands(self) -> List[str]:

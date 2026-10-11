@@ -23,7 +23,7 @@ from app.analyzers.webpage.visual import analyze_visual
 from app.cache.store import get_cache
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.core.security import SSRFBlockedError, sanitize_html_to_text
+from app.core.security import SSRFBlockedError, normalize_url_input, sanitize_html_to_text
 from app.db.repository import save_analysis
 from app.llm.ollama_client import get_llm_assessment
 from app.ml.prefilter import get_prefilter
@@ -48,6 +48,45 @@ def _cache_key(kind: str, payload: dict | None = None, target: str = "") -> str:
                           sort_keys=True, default=str)
     digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
     return f"phishbrain:analysis:{kind}:{digest}"
+
+
+# Why a page could not be read, in words a reader can act on. The raw
+# `webpage.fetch_failed` code told the dashboard nothing about whether the host
+# was blocked, slow, or refusing us, so a live scan of an unreachable site
+# looked like a scanner fault instead of "this host does not answer us".
+_FETCH_FAILURE_REASONS: dict[str, str] = {
+    "ConnectTimeout": "the connection attempt timed out — the host is unreachable from this network (firewall, geo-block, or the site is down)",
+    "ConnectError": "the host refused or dropped the connection",
+    "ReadTimeout": "the host accepted the connection but sent no data before the timeout",
+    "WriteTimeout": "the request could not be sent to the host",
+    "PoolTimeout": "the fetch timed out waiting for a free connection",
+    "TimeoutException": "the host did not respond before the timeout",
+    "SSLError": "the TLS handshake failed, so the certificate could not be trusted",
+    "TooManyRedirects": "the request was redirected too many times",
+    "RemoteProtocolError": "the server closed the connection mid-response",
+    "UnsupportedProtocol": "the URL scheme is not one this scanner fetches",
+    "InvalidURL": "the URL could not be parsed",
+}
+
+
+def describe_fetch_degraded(code: str) -> str | None:
+    """Turn a fetch-related degraded code into a sentence, or return None."""
+    if code == "webpage.fetch_blocked":
+        return "the URL was refused by the outbound safety guard, so nothing was fetched"
+    if code == "webpage.truncated":
+        return "the page was larger than the size cap and was truncated"
+    if code.startswith("webpage.http_"):
+        status = code.removeprefix("webpage.http_")
+        return (
+            f"the host answered HTTP {status}, so no page was served — an error body "
+            "is the server's own notice, not the page"
+        )
+    if code.startswith("webpage.fetch_failed:"):
+        kind = code.split(":", 1)[1]
+        return _FETCH_FAILURE_REASONS.get(
+            kind, f"the page fetch failed ({kind})"
+        )
+    return None
 
 
 async def _run_with_timeout(coro, timeout: float, layer_name: str, degraded: list[str]):
@@ -133,6 +172,12 @@ async def _attach_visual_evidence(
     layer.details["visual_similarity_score"] = similarity
     layer.details["possible_brand"] = visual.get("closest_brand")
 
+    # The evidence image (downscaled; wireframe in that mode). Attached so the
+    # dashboard can SHOW what was compared instead of only reporting a distance.
+    screenshot = visual.get("screenshot_data_url")
+    if isinstance(screenshot, str) and screenshot:
+        layer.details["screenshot_data_url"] = screenshot
+
     icon = visual.get("icon") if isinstance(visual.get("icon"), dict) else {}
     notes: list[str] = []
 
@@ -214,6 +259,20 @@ async def run_analysis(
     overall_deadline = settings.ANALYSIS_TIMEOUT_SECONDS
     per_layer_timeout = max(2.0, overall_deadline / 2)
 
+    # Second line of defence for scheme-less input. The API routes normalise
+    # their payload, but `run_analysis` is also reachable from other callers
+    # (and from tests), and a raw `hianime.to` here reached the fetch as a
+    # scheme-less string and was silently degraded instead of scanned.
+    if url:
+        normalized = normalize_url_input(url)
+        if normalized and normalized != url:
+            logger.info(
+                "Normalised target", extra={"extra_fields": {"from": url, "to": normalized}}
+            )
+            url = normalized
+            if input_type in {"url", "page"}:
+                target = normalized
+
     hostname = urlparse(url).hostname if url else None
     phase = start
 
@@ -230,6 +289,24 @@ async def run_analysis(
     # *inside* the webpage layer, so a live URL scan handed the LLM no page
     # content at all and it assessed the URL string by itself. Sharing one fetch
     # also avoids paying for the page twice.
+    #
+    # The domain lookups (RDAP + DNS + TLS) run concurrently with that fetch:
+    # they are independent and both network-bound, and running them in sequence
+    # put the shorter of the two on the critical path of every scan (measured
+    # ~9s of a 58s scan whose host never answered at all).
+    concurrent_layers: list = []
+    if hostname:
+        concurrent_layers.append(
+            asyncio.ensure_future(
+                _run_with_timeout(
+                    analyze_domain(hostname, timeout=per_layer_timeout),
+                    per_layer_timeout,
+                    "domain",
+                    degraded,
+                )
+            )
+        )
+
     prefetch_attempted = bool(url and html is None and fetch_page_flag and dom_summary is None)
     prefetched_html = html
     if prefetch_attempted:
@@ -242,6 +319,17 @@ async def run_analysis(
         fetched_html, fetch_degraded = prefetched if prefetched else (None, [])
         prefetched_html = fetched_html
         degraded.extend(fetch_degraded)
+
+    # Why the page could not be read, if it could not. Attached to the webpage
+    # layer below so the report says what happened instead of showing an empty
+    # "unavailable" layer.
+    fetch_failure: str | None = None
+    if prefetch_attempted and prefetched_html is None:
+        for code in degraded:
+            reason = describe_fetch_degraded(code)
+            if reason:
+                fetch_failure = reason
+                break
     phase = mark("fetch_ms", phase)
 
     if email_fields:
@@ -260,15 +348,6 @@ async def run_analysis(
             degraded.append("email.error")
             logger.warning("Email layer failed", extra={"extra_fields": {"error": str(exc)}})
 
-    # Domain lookups and webpage analysis are independent, so overlapping them
-    # takes the shorter of the two off the critical path entirely.
-    concurrent_layers = []
-    if hostname:
-        concurrent_layers.append(
-            _run_with_timeout(
-                analyze_domain(hostname, timeout=per_layer_timeout), per_layer_timeout, "domain", degraded
-            )
-        )
     if url and (prefetched_html is not None or dom_summary is not None or prefetch_attempted):
         concurrent_layers.append(
             _run_with_timeout(
@@ -295,6 +374,20 @@ async def run_analysis(
         layers[evidence.layer] = evidence
         if evidence.layer == "webpage" and evidence.unavailable:
             degraded.append("webpage.unavailable")
+
+    # A page layer with nothing in it is unreadable as a *finding*. Name the
+    # fetch outcome and what it means for the score, because "webpage: not
+    # applicable" next to "/ 100" reads as a missing feature rather than
+    # "this host never answered".
+    if fetch_failure and "webpage" in layers:
+        page_layer = layers["webpage"]
+        page_layer.details["page_fetch_failed"] = fetch_failure
+        page_layer.details["page_fetch_outcome"] = "failed"
+        page_layer.notes = ((page_layer.notes + "; ") if page_layer.notes else "") + fetch_failure
+    elif "webpage" in layers and layers["webpage"].unavailable and not prefetch_attempted:
+        layers["webpage"].details.setdefault(
+            "page_fetch_outcome", "not_requested"
+        )
 
     layer_list = list(layers.values())
     phase = mark("collect_ms", phase)
@@ -358,7 +451,13 @@ async def run_analysis(
             marks[name] = round((time.monotonic() - started) * 1000, 1)
 
     concurrent_tail = []
-    if url and "webpage" in layers:
+    # The screenshot is only meaningful when there is a page to render. Running
+    # it after a failed fetch made Playwright render the browser's own error
+    # page, cost ~26s of CPU, and still reported "visual: unavailable" — the
+    # single largest waste in a scan of an unreachable host.
+    page_available = prefetched_html is not None or dom_summary is not None
+    has_caller_screenshot = bool(screenshot_base64)
+    if url and "webpage" in layers and (page_available or has_caller_screenshot):
         concurrent_tail.append(
             _timed(
                 "visual_ms",
@@ -367,6 +466,12 @@ async def run_analysis(
                 ),
             )
         )
+    elif url and "webpage" in layers:
+        layers["webpage"].details["visual_indicators"] = [
+            "Not attempted: "
+            + (fetch_failure or "the page could not be read")
+            + " — there was no rendered page to compare against the brand references."
+        ]
     if not skip_llm:
         concurrent_tail.append(_timed("llm_ms", _run_llm_layer()))
     if concurrent_tail:
@@ -388,12 +493,36 @@ async def run_analysis(
         prefilter_model_trained=bool(prefilter_result.get("model_trained")),
     )
 
+    provenance = prefilter_result.get("provenance") or {}
     if prefilter_result.get("model_trained"):
         prefilter_note = (
             f"CatBoost prefilter contributed {scoring['prefilter_weight']:.0%} of the base score."
             if scoring["prefilter_blended"]
             else "Trained CatBoost prefilter available but not blended for this input."
         )
+        if prefilter_result.get("calibrated"):
+            prefilter_note += (
+                " Score is the calibrated probability (raw score "
+                f"{float(prefilter_result.get('raw_score') or 0):.1f}/100)."
+            )
+        threshold = provenance.get("decision_threshold")
+        if isinstance(threshold, (int, float)):
+            above = float(prefilter_result["score"]) >= float(threshold) * 100.0
+            prefilter_note += (
+                f" Operating point {float(threshold) * 100:.0f}/100 — this URL scored "
+                f"{'above' if above else 'below'} it, and the prefilter contributes "
+                f"{scoring['prefilter_weight']:.0%} of the base score either way."
+            )
+        tier = provenance.get("gate_tier")
+        if tier:
+            prefilter_note += (
+                f" Deployed model cleared the '{tier}' deployment gate"
+                + (
+                    "; it has NOT met the stricter, sole-decision-maker bar."
+                    if tier != "strict"
+                    else "."
+                )
+            )
     else:
         prefilter_note = (
             "No trained CatBoost model on disk; the deterministic feature-weighted "
@@ -411,6 +540,27 @@ async def run_analysis(
         blended=bool(scoring["prefilter_blended"]),
         note=prefilter_note,
         layer_score=scoring["layer_score"],
+        raw_score=(
+            round(float(prefilter_result["raw_score"]), 2)
+            if prefilter_result.get("raw_score") is not None
+            else None
+        ),
+        calibrated=bool(prefilter_result.get("calibrated")),
+        gate_tier=provenance.get("gate_tier"),
+        gate_passed=provenance.get("gate_passed"),
+        split=provenance.get("split"),
+        trained_at=provenance.get("trained_at"),
+        decision_threshold=(
+            float(provenance["decision_threshold"])
+            if isinstance(provenance.get("decision_threshold"), (int, float))
+            else None
+        ),
+        score_above_threshold=(
+            bool(float(prefilter_result["score"]) >= float(provenance["decision_threshold"]) * 100.0)
+            if prefilter_result.get("model_trained")
+            and isinstance(provenance.get("decision_threshold"), (int, float))
+            else None
+        ),
     )
 
     analysis_id = str(uuid.uuid4())

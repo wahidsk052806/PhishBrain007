@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
+from app.ml.calibration import apply_calibration, calibration_available
 from app.ml.url_features import (
     extract_prefilter_features,
     ml_features_available,
@@ -27,6 +28,11 @@ class Prefilter:
         self.model = None
         self.model_trained = False
         self.feature_names: list[str] = training_feature_names()
+        # Provenance of the deployed artifact: its calibration (so the score is
+        # a real probability, not the class-weighted one) and the gate tier it
+        # cleared (so "deployed" is never read as "precision-grade").
+        self.meta: dict = {}
+        self.calibration: dict | None = None
         self._try_load()
 
     def _try_load(self) -> None:
@@ -44,6 +50,42 @@ class Prefilter:
         self.model = model
         self.feature_names = self._resolve_feature_names(model)
         self.model_trained = True
+        self.meta = self._load_meta()
+        calibration = self.meta.get("calibration")
+        self.calibration = calibration if isinstance(calibration, dict) else None
+
+    @staticmethod
+    def _load_meta() -> dict:
+        if not META_PATH.exists():
+            return {}
+        try:
+            meta = json.loads(META_PATH.read_text())
+        except Exception:  # noqa: BLE001
+            return {}
+        return meta if isinstance(meta, dict) else {}
+
+    def provenance(self) -> dict:
+        """What the deployed artifact claims about itself (all optional)."""
+        gate = self.meta.get("gate") if isinstance(self.meta.get("gate"), dict) else {}
+        calibration = self.calibration or {}
+        return {
+            "trained_at": self.meta.get("trained_at"),
+            "split": self.meta.get("split"),
+            "split_mode": self.meta.get("split_mode"),
+            "gate_tier": gate.get("tier"),
+            "gate_passed": bool(gate.get("passed")) if gate else None,
+            "gate_strict_passed": gate.get("strict_passed"),
+            "calibration": (
+                "platt"
+                if calibration.get("method") == "platt" and calibration_available()
+                else (calibration.get("method") or "none")
+            ),
+            # The score at which the model's own held-out evaluation says
+            # "suspicious". Without it a reader cannot tell whether 42/100 is
+            # alarming or comfortably below the line the model was validated at.
+            "decision_threshold": self.meta.get("decision_threshold"),
+            "gate_note": gate.get("tier_meaning"),
+        }
 
     @staticmethod
     def _resolve_feature_names(model) -> list[str]:
@@ -87,14 +129,27 @@ class Prefilter:
         if self.model_trained and self.model is not None and url and ml_features_available():
             try:
                 lexical = extract_prefilter_features(str(url))
-                proba = self.model.predict_proba(self._vectorize(lexical))[0][1]
-                return {"score": float(proba) * 100.0, "model_trained": True, "method": "catboost"}
+                proba = float(self.model.predict_proba(self._vectorize(lexical))[0][1])
+                # The stored map is what the gate validated; serve the calibrated
+                # score and keep the raw one for auditability.
+                calibrated = apply_calibration(proba, self.calibration)
+                return {
+                    "score": calibrated * 100.0,
+                    "raw_score": proba * 100.0,
+                    "calibrated": calibrated != proba,
+                    "model_trained": True,
+                    "method": "catboost",
+                    "provenance": self.provenance(),
+                }
             except Exception:  # noqa: BLE001
                 pass
         return {
             "score": self._deterministic_fallback(features),
+            "raw_score": None,
+            "calibrated": False,
             "model_trained": False,
             "method": "deterministic_weighted_fallback",
+            "provenance": self.provenance() if self.model_trained else {},
         }
 
 
