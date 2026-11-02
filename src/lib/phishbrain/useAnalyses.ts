@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api, BackendUnavailableError } from "./api";
 import { loadDemoHistory, seedDemoHistoryIfEmpty } from "./demo";
 import type { AnalysisResult } from "./types";
+import { useBackendEndpoint } from "./useBackendEndpoint";
 import { usePhishbrainSettings } from "./usePhishbrainSettings";
 
 export interface AnalysesState {
@@ -21,6 +22,10 @@ export interface AnalysesState {
  */
 export function useAnalyses(): AnalysesState {
   const { settings } = usePhishbrainSettings();
+  // History is read from whichever endpoint answered, so the reader must re-run
+  // when that is decided — otherwise a LAN visitor keeps seeing the empty list
+  // produced by asking their own `localhost` before the probe finished.
+  const { resolution } = useBackendEndpoint();
   const [items, setItems] = useState<AnalysisResult[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -73,7 +78,7 @@ export function useAnalyses(): AnalysesState {
       window.removeEventListener("phishbrain:history", onLocal);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings.backendUrl, settings.demoMode, nonce]);
+  }, [settings.backendUrl, settings.demoMode, nonce, resolution?.url]);
 
   return { items, loading, error, source, reload };
 }

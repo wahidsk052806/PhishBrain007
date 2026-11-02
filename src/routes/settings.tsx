@@ -4,7 +4,9 @@ import { CheckCircle2, XCircle } from "lucide-react";
 import { AppShell } from "@/components/phishbrain/AppShell";
 import { api } from "@/lib/phishbrain/api";
 import { clearDemoHistory } from "@/lib/phishbrain/demo";
+import { useBackendEndpoint } from "@/lib/phishbrain/useBackendEndpoint";
 import { usePhishbrainSettings } from "@/lib/phishbrain/usePhishbrainSettings";
+import { DEFAULT_SETTINGS } from "@/lib/phishbrain/settings";
 
 export const Route = createFileRoute("/settings")({
   head: () => ({
@@ -27,6 +29,7 @@ export const Route = createFileRoute("/settings")({
 
 function SettingsPage() {
   const { settings, update } = usePhishbrainSettings();
+  const { resolution, refresh } = useBackendEndpoint();
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -76,22 +79,37 @@ function SettingsPage() {
     setTestResult(null);
     try {
       const health = await api.health();
-      const components = Object.entries(health.components)
-        .map(([k, v]) => `${k}: ${v}`)
-        .join(", ");
+      // The API reports each dependency by name; the old `components` map it
+      // was read from never existed, so this line used to say "undefined".
+      const components = [
+        `database ${health.database}${health.database_backend ? ` (${health.database_backend})` : ""}`,
+        `cache ${health.cache}${health.cache_backend ? ` (${health.cache_backend})` : ""}`,
+        `LLM ${health.ollama}`,
+      ].join(", ");
       setTestResult({
         ok: true,
-        message: `Backend ${health.status} (v${health.version}). ${components}`,
+        message: `Backend ${health.status}. ${components}`,
       });
+      // A backend that has just been started should be picked up without a
+      // reload: re-probe so the header badge and the engine line agree.
+      await refresh();
     } catch (err) {
+      const tried = resolution?.tried.map((t) => t.url).join(", ") ?? settings.backendUrl;
       setTestResult({
         ok: false,
-        message: `Could not reach ${settings.backendUrl}. ${err instanceof Error ? err.message : ""}`,
+        message: `Could not reach a backend (tried ${tried}). ${err instanceof Error ? err.message : ""}`,
       });
+      await refresh();
     } finally {
       setTesting(false);
     }
   }
+
+  // The engine is resolved by probing, and the probe list is shown so an
+  // operator on a phone or second laptop can see exactly which addresses were
+  // tried and add whichever one is missing.
+  const engine = resolution?.engine;
+  const serverSide = engine !== undefined && engine !== "backend";
 
   return (
     <AppShell title="Settings" description="Dashboard configuration (no secrets are stored here)">
@@ -110,9 +128,53 @@ function SettingsPage() {
             className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
           />
           <p className="mt-1 text-xs text-muted-foreground">
-            Default <span className="font-mono">http://localhost:8000</span> (docker compose service
-            <span className="font-mono"> backend</span>).
+            {/* Naming the value this build actually ships, not a hardcoded
+                localhost: a production build defaults to the deployed API and a
+                development build to the local docker compose service. */}
+            Default <span className="font-mono">{DEFAULT_SETTINGS.backendUrl}</span> (the API for
+            this build — the docker compose service
+            <span className="font-mono"> backend</span> locally).
+            {serverSide ? (
+              <>
+                {" "}
+                Scans currently run without it: no API answered, so this site uses its own server
+                engine instead (fetch, DNS-over-HTTPS, RDAP, DOM analysis). Point this at a
+                reachable API base to add the CatBoost pre-filter, the local LLM verdict and
+                screenshots.
+              </>
+            ) : null}
           </p>
+          <div className="mt-2 rounded-md border border-border bg-muted/40 p-2.5 text-xs">
+            <p className="font-medium">
+              Engine in use:{" "}
+              <span className="font-mono">
+                {engine === undefined
+                  ? "probing…"
+                  : engine === "backend"
+                    ? `backend at ${resolution?.url}`
+                    : engine === "hosted"
+                      ? "hosted server engine"
+                      : "built-in browser scanner"}
+              </span>
+            </p>
+            {resolution?.tried.length ? (
+              <ul className="mt-1 space-y-0.5 text-muted-foreground">
+                {resolution.tried.map((t) => (
+                  <li key={t.url}>
+                    <span className="font-mono">{t.url}</span>
+                    {" — "}
+                    {t.reachable ? "answered" : "no answer"}
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+            <p className="mt-1 text-muted-foreground">
+              Opening this dashboard from another device on your network? The page's own host is
+              probed on the backend port as well, so a backend started with{" "}
+              <span className="font-mono">--host 0.0.0.0</span> and allowed through the firewall is
+              found automatically — see “Use it from another device” in the README.
+            </p>
+          </div>
           <button
             type="button"
             onClick={() => void testConnection()}

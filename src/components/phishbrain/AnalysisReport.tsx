@@ -1,4 +1,4 @@
-import { Download, FlaskConical, Loader2, TriangleAlert } from "lucide-react";
+import { Download, FlaskConical, Info, Loader2, TriangleAlert } from "lucide-react";
 import type { AnalysisResult } from "@/lib/phishbrain/types";
 import { api } from "@/lib/phishbrain/api";
 import { describeDegraded } from "@/lib/phishbrain/normalize";
@@ -45,6 +45,22 @@ function toCsv(r: AnalysisResult) {
 
 export function AnalysisReport({ result }: { result: AnalysisResult }) {
   const { prefilter } = result;
+  // A host with no DNS address is a *result*, not a missing layer: there is no
+  // page to read, and an unregistered name cannot be serving a credential form.
+  // The pipeline records that on the webpage layer so the report can say it in
+  // words instead of showing a silent "Not applicable" beside a score.
+  const pageDetails = result.layers.webpage.evidence as Record<string, unknown>;
+  const unresolvedHost =
+    pageDetails["dns_unresolved"] === true ||
+    pageDetails["page_fetch_outcome"] === "unresolved";
+  const unresolvedReason =
+    typeof pageDetails["page_fetch_failed"] === "string"
+      ? (pageDetails["page_fetch_failed"] as string)
+      : "";
+  const registration = (result.layers.domain.evidence as Record<string, unknown>)[
+    "registration_status"
+  ];
+  const domainNotRegistered = registration === "not_registered";
   // `null` means no pre-filter ran for this result (the in-browser engines),
   // which is not the same statement as "no trained model exists".
   const prefilterStatus =
@@ -80,6 +96,27 @@ export function AnalysisReport({ result }: { result: AnalysisResult }) {
             is still running and can adjust it. This report updates in place when the verdict lands.
           </span>
         </p>
+      ) : null}
+
+      {unresolvedHost ? (
+        <section className="flex items-start gap-3 rounded-md border border-primary/40 bg-primary/10 px-4 py-3 text-sm">
+          <Info aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-primary" />
+          <div className="space-y-1">
+            <p className="font-semibold">
+              No live page — {domainNotRegistered ? "this domain is not registered" : "this domain does not resolve"}.
+            </p>
+            {unresolvedReason ? (
+              <p className="text-muted-foreground">{unresolvedReason}</p>
+            ) : null}
+            <p className="text-muted-foreground">
+              The page and visual layers were skipped rather than failed, because a name with no
+              DNS address has nothing to serve. The score below is built from the URL string, the
+              registration lookup and the local model. A low score here means “there is no live
+              site to visit”, not “the site was inspected and found clean” — the name can still be
+              a lookalike of a real brand.
+            </p>
+          </div>
+        </section>
       ) : null}
 
       {result.degraded.length ? (
@@ -237,7 +274,16 @@ export function AnalysisReport({ result }: { result: AnalysisResult }) {
           What the on-device model concluded about this target. PhishBrain surfaces only the model's
           structured security summary — raw chain-of-thought is never shown.
         </p>
-        {result.llm_assessment.status !== "unavailable" ? (
+        {result.llm_assessment.status === "skipped" && (
+          <p className="text-sm text-muted-foreground">
+            Not consulted. The rule-based layers already fixed this verdict, and the model's
+            adjustment is bounded, so it could not have changed it — the scan skipped the model's
+            CPU time instead of paying ~20 s to restate the same answer. Every layer above is real
+            evidence from this scan.
+          </p>
+        )}
+        {result.llm_assessment.status !== "unavailable" &&
+          result.llm_assessment.status !== "skipped" && (
           <>
             <dl className="grid gap-2 text-sm sm:grid-cols-2">
               <div>
@@ -287,7 +333,8 @@ export function AnalysisReport({ result }: { result: AnalysisResult }) {
             ) : null}
             <p className="mt-3 text-sm">{result.llm_assessment.explanation}</p>
           </>
-        ) : (
+        )}
+        {result.llm_assessment.status === "unavailable" && (
           <div className="rounded-md border border-border bg-muted/40 p-3 text-sm">
             <p className="font-medium">LLM reasoning was not available for this result.</p>
             <p className="mt-1 text-muted-foreground">{result.llm_assessment.explanation}</p>

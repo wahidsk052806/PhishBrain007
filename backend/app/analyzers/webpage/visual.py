@@ -250,12 +250,16 @@ async def capture_screenshot(url: str, timeout_ms: int = 30000) -> bytes | None:
                     await route.continue_()
 
                 await page.route("**/*", _route)
+                # Every action is bounded by the same budget as the navigation:
+                # Playwright's default screenshot timeout is 30 s on top of the
+                # navigation, so one stuck page could cost twice the budget.
+                page.set_default_timeout(timeout_ms)
                 await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
 
                 # Final safety net: validate the URL we actually landed on.
                 guard_url(page.url)
 
-                screenshot = await page.screenshot(type="png")
+                screenshot = await page.screenshot(type="png", timeout=timeout_ms)
                 return screenshot
             finally:
                 await browser.close()
@@ -341,9 +345,13 @@ def _capture_screenshot_sync(url: str, timeout_ms: int = 30000) -> bytes:
                     route.continue_()
 
                 page.route("**/*", _route)
+                # Same reasoning as the async path: navigation plus capture must
+                # fit in one budget, or this thread outlives the caller and its
+                # browser is never closed.
+                page.set_default_timeout(timeout_ms)
                 page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
                 guard_url(page.url)
-                return page.screenshot(type="png")
+                return page.screenshot(type="png", timeout=timeout_ms)
             finally:
                 browser.close()
     except SSRFBlockedError as exc:
@@ -523,7 +531,15 @@ async def analyze_visual(
 
     if image_bytes is None:
         try:
-            image_bytes = await capture_screenshot(url)
+            # Deliberately *shorter* than the caller's own budget (the pipeline
+            # allows VISUAL_TIMEOUT_SECONDS, 30 s). A capture that outlives its
+            # caller keeps a Chromium and its renderer processes alive for as
+            # long as the stuck page takes: on a 2-core/16 GB box that made the
+            # following scans slower and slower, and a page that never settles
+            # could hold a browser for minutes after its scan had given up.
+            # Ending inside the budget means the `finally: browser.close()`
+            # always runs.
+            image_bytes = await capture_screenshot(url, timeout_ms=20_000)
         except ScreenshotUnavailable as exc:
             # The icon comparison may still have produced a usable answer, so
             # report what we have instead of discarding it.

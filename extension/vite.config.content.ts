@@ -50,6 +50,14 @@ function copyStaticAssets() {
 
 export default defineConfig(({ mode }) => ({
   plugins: [react(), tailwindcss(), copyStaticAssets()],
+  // Vite deliberately leaves `process.env.NODE_ENV` in place for library
+  // builds, but this bundle runs in a page where `process` does not exist:
+  // React's module header evaluates `process.env.NODE_ENV` immediately, so the
+  // shipped content script died with "process is not defined" before it ever
+  // registered a listener — no email was parsed and no page was analysed.
+  define: {
+    "process.env.NODE_ENV": JSON.stringify(mode === "development" ? "development" : "production"),
+  },
   build: {
     outDir: "dist",
     emptyOutDir: false,

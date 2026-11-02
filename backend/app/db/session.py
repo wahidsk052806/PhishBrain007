@@ -17,12 +17,30 @@ _engine = None
 _SessionLocal: sessionmaker | None = None
 
 
+def sqlalchemy_url(url: str) -> str:
+    """Name the Postgres driver that this project actually installs.
+
+    SQLAlchemy resolves a bare ``postgresql://`` URL to psycopg2, but the
+    requirements pin psycopg 3 (``psycopg[binary]``) and do not install psycopg2.
+    In a Compose deployment that mismatch was invisible in the UI: the scan
+    itself still answered, while the app logged "Database initialization
+    failed: No module named 'psycopg2'", every analysis failed to persist, the
+    history page stayed empty and ``/health`` reported ``degraded`` without
+    saying which subsystem was down. Spelling the driver out makes the URL and
+    the installed package agree. SQLite URLs are returned unchanged.
+    """
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg://" + url[len(prefix):]
+    return url
+
+
 def get_engine():
     global _engine
     if _engine is None:
         settings = get_settings()
         connect_args = {}
-        url = settings.DATABASE_URL
+        url = sqlalchemy_url(settings.DATABASE_URL)
         if url.startswith("sqlite"):
             connect_args = {"check_same_thread": False}
         _engine = create_engine(url, connect_args=connect_args, future=True)

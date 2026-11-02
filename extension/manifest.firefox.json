@@ -21,9 +21,8 @@
     "https://*/*",
     "http://localhost:8000/*",
     "http://127.0.0.1:8000/*",
-    "https://www.phishbrain07.app/*",
-    "https://phishbrain07.app/*",
-    "https://phishbrain007.lovable.app/*"
+    "https://phishbrain007.app/*",
+    "https://api.phishbrain007.app/*"
   ],
   "background": {
     "scripts": [
@@ -39,6 +38,7 @@
       "128": "icons/icon128.png"
     }
   },
+  "homepage_url": "https://phishbrain007.app",
   "options_ui": {
     "page": "options.html",
     "open_in_tab": true
@@ -66,6 +66,9 @@
           "websiteContent"
         ]
       }
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
     }
   }
 }

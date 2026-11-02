@@ -130,4 +130,10 @@ export interface AnalysisResult {
   latency_ms: number;
   degraded: string[];
   demo?: boolean;
+  /**
+   * Deterministic-layers result shown while the page fetch, screenshot
+   * comparison and local LLM verdict are still running. The popup keeps
+   * polling until a result without this flag replaces it.
+   */
+  provisional?: boolean;
 }

@@ -28,22 +28,76 @@ class Settings(BaseSettings):
 
     LLM_PROVIDER: str = Field(default="ollama")
     OLLAMA_BASE_URL: str = Field(default="http://localhost:11434")
-    OLLAMA_MODEL: str = Field(default="llama3.1")
+    # llama3.2:3b is the default because it is the largest model that answers a
+    # full scan acceptably on the hardware this project documents (4 CPU / 8 GB).
+    # Measured on that box, warm: ~19 s for one verdict. llama3.1:8b needs
+    # ~4.9 GB resident and took ~293 s for the same request there, so it is an
+    # opt-in for 16 GB machines rather than the out-of-the-box model.
+    OLLAMA_MODEL: str = Field(default="llama3.2:3b")
 
+    # Budget for the network-only layers (page fetch, RDAP/DNS/TLS, DOM read).
     ANALYSIS_TIMEOUT_SECONDS: float = Field(default=20.0)
     CACHE_TTL_SECONDS: int = Field(default=3600)
+
+    # How long one LLM verdict may take, measured from the moment the request
+    # reaches Ollama. Deliberately separate from ANALYSIS_TIMEOUT_SECONDS: a
+    # CPU model needs far longer to answer than a HTTP fetch needs to time out,
+    # and sharing the 20 s network budget is what made every scan report
+    # "the model did not answer within the scan deadline" (the request was
+    # cancelled mid-generation, and each cancel also aborted Ollama's load).
+    #
+    # Sized from measurement, not taste: on a 4 vCPU / 8 GB Docker host a real
+    # scan prompt is ~640 tokens at ~10 tokens/s of prompt processing plus ~80
+    # generated tokens at ~4 tokens/s, i.e. ~95-100 s end to end with the model
+    # already resident. 90 s cut it off during prompt processing (progress 0.83)
+    # and reported the LLM as unavailable; 150 s leaves headroom for a slower
+    # box or a longer page summary.
+    LLM_TIMEOUT_SECONDS: float = Field(default=150.0, ge=5.0)
+    # Loading the weights is a one-off cost paid by the warm-up, not by a scan.
+    # 8B on 4 cores measured ~97 s; a cold 3B ~19 s. Generous on purpose — a
+    # timeout here cancels the load, so the model would never become resident.
+    LLM_WARMUP_TIMEOUT_SECONDS: float = Field(default=300.0, ge=10.0)
 
     # How much of the fetched page is handed to the LLM. The page text is
     # untrusted and prompt size dominates CPU inference time, so this is a
     # deliberate cap rather than "as much as we downloaded".
     LLM_WEBPAGE_SUMMARY_CHARS: int = Field(default=1200, ge=0)
-    # Cap the generated response. The schema needs ~120 tokens; letting a small
-    # CPU model ramble to 2000 tokens was most of a scan's wall-clock time.
-    LLM_NUM_PREDICT: int = Field(default=320, ge=16)
+    # Cap the generated response. The schema needs ~100-120 tokens; letting a
+    # small CPU model ramble to 2000 tokens was most of a scan's wall-clock time.
+    #
+    # Measured on the documented 4-core box with `llama3.2:3b`: a complete,
+    # valid SAFE verdict is 82-83 tokens, generated at ~6.8 tokens/s. The old
+    # 320 cap was therefore ~47 s of generation in the worst case, on a scan
+    # whose whole deterministic half takes ~2 s — which is why the model, not
+    # the analysis, dominated the latency. 160 keeps >2x headroom over the
+    # measured response and bounds a scan to ~24 s of generation.
+    LLM_NUM_PREDICT: int = Field(default=160, ge=16)
+
+    # The model's adjustment is clamped to +/-LLM_ADJUSTMENT_CLAMP (15), so when
+    # the deterministic base score is far enough from a risk boundary that no
+    # legal adjustment can cross one, the verdict is already fixed: running a 3B
+    # model for ~20 s cannot change it. Skipping is recorded as `llm.not_needed`
+    # in `degraded` (it is never silent) and exempted from the confidence
+    # penalty, because it is a decision, not a failure. Set to false to make the
+    # model a second opinion on every scan.
+    LLM_SKIP_WHEN_DECISIVE: bool = Field(default=True)
     # Keep the model resident between scans. Without this, Ollama unloads it
     # after its default idle window and the next scan pays a cold start that is
     # many times the inference cost itself.
     LLM_KEEP_ALIVE: str = Field(default="30m")
+    # How many scans may use the two CPU-bound layers at the same time, and how
+    # long a request waits for a slot before it finishes without that layer.
+    #
+    # A 4-core host cannot run three Chromium renders and three llama.cpp
+    # generations at once: without a ceiling every concurrent scan exceeded its
+    # own deadline and reported "the model did not answer", i.e. a working
+    # server looked broken. One slot each, a short queue, and a clearly labelled
+    # `llm.busy` / `visual.busy` skip is the honest behaviour for a shared box.
+    # Raise these only with the CPU to back them.
+    MAX_CONCURRENT_LLM_SCANS: int = Field(default=1, ge=1)
+    MAX_CONCURRENT_VISUAL_SCANS: int = Field(default=1, ge=1)
+    SCAN_QUEUE_TIMEOUT_SECONDS: float = Field(default=20.0, ge=0.0)
+
     # Load the model into memory at startup instead of during the first scan.
     # Loading costs ~30 s of CPU on a 4-core box, which the first request would
     # otherwise pay for; set to false on a memory-constrained deployment where
@@ -90,6 +144,34 @@ class Settings(BaseSettings):
     MAX_REQUEST_BYTES: int = Field(default=2_000_000)
     MAX_FETCH_BYTES: int = Field(default=3_000_000)
 
+    # Origins the API answers cross-origin requests from. The dashboard is
+    # normally opened on the same machine as the backend, but the point of a
+    # self-hosted detector is that it can also be opened from a phone or a second
+    # laptop on the same network — and the browser then refuses to let that page
+    # call the API unless the private address it was served from is allowed.
+    # Loopback, the browser-extension IDs and private (RFC 1918) hosts are
+    # therefore permitted by default. A public origin is not: an arbitrary
+    # internet page must not be able to use the operator's backend as a free
+    # scanning service, and a phishing page must not be able to probe it.
+    # Override this to restrict access to named origins.
+    CORS_ORIGIN_REGEX: str = Field(
+        default=(
+            # Both extension schemes: Chromium reports
+            # `chrome-extension://<id>` and Firefox reports
+            # `moz-extension://<uuid>`. Allowing only the first meant a
+            # deployed backend accepted the extension on Chrome and refused it
+            # on Firefox, which looked like "the hosted backend is down".
+            r"^((?:chrome|moz)-extension://.*"
+            r"|https?://localhost(:\d+)?"
+            r"|https?://127\.0\.0\.1(:\d+)?"
+            r"|https?://(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+            r"|192\.168\.\d{1,3}\.\d{1,3}"
+            r"|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
+            r"|[A-Za-z0-9-]+\.local)(?::\d+)?"
+            r")$"
+        )
+    )
+
     # Sent when fetching a target page or taking its screenshot. The library
     # default ("python-httpx/x.y") is refused outright by a lot of the web —
     # Wikipedia answers 403 with a 126-byte notice, for example — and because
@@ -116,6 +198,12 @@ class Settings(BaseSettings):
     # Set to false to disable the automatic screenshot-evidence sweep entirely
     # (the retention policy then only runs when an operator calls it).
     VISUAL_AUTO_PURGE_ENABLED: bool = Field(default=True)
+    # Budget for one rendered-screenshot comparison, including Chromium's cold
+    # launch. It is not part of the network-layer deadline: rendering a real page
+    # is slower than fetching it, and a 10 s slice (the old half-deadline) cut
+    # the capture off on image-heavy sites and reported "visual: unavailable"
+    # for a page that would have rendered fine.
+    VISUAL_TIMEOUT_SECONDS: float = Field(default=30.0, ge=5.0)
 
     @field_validator("APP_ENV")
     @classmethod

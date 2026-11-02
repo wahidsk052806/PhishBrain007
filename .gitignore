@@ -1,6 +1,7 @@
 # Logs
 logs
 *.log
+*.err
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -45,6 +46,8 @@ backend/venv/
 
 # Build output for the browser extension
 extension/dist/
+# Firefox-flavoured copy of dist (Firefox manifest as manifest.json)
+extension/dist-firefox/
 extension/web-ext-artifacts/
 
 # Reference-capture scratch: the persistent Chrome profile and the per-run
@@ -52,6 +55,9 @@ extension/web-ext-artifacts/
 # curated, committed gap list live in extension/data/).
 scripts/data/.tmp-profile/
 scripts/data/.tmp-screens/
+
+# Generated report/PDF build tooling (kept out of the tree on purpose)
+.tmp-report/
 extension/data/reference_capture_report.json
 
 # Editor directories and files

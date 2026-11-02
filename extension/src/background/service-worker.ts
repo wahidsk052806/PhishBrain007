@@ -1,14 +1,24 @@
-import { storage, tabsApi, runtimeApi, actionApi, notificationsApi } from "../lib/browser";
+import {
+  storage,
+  tabsApi,
+  runtimeApi,
+  actionApi,
+  notificationsApi,
+  scriptingApi,
+} from "../lib/browser";
 import {
   analyzeUrl,
   analyzePage,
   analyzeEmail,
   analyzeUrlCloud,
   analyzeEmailCloud,
+  backendCandidates,
   ApiError,
 } from "../services/api";
 import type { Settings } from "../lib/settings";
 import { getSettings, setSettings, DEFAULT_SETTINGS } from "../lib/settings";
+import { configuredDashboardOrigin, resolveHostedEmail, resolveHostedScan } from "../lib/hosted";
+import { isMailProviderUrl, mailProviderFor } from "../lib/mail-hosts";
 import type { AnalysisResult } from "../types/analysis";
 import {
   shouldScanUrl,
@@ -19,6 +29,13 @@ import {
   parseIncomingMessage,
   type CacheEntry,
 } from "./logic";
+import {
+  buildSocAlert,
+  buildTestAlert,
+  sendSocAlert,
+  shouldSendAlert,
+  type AlertDelivery,
+} from "./alerts";
 import { runVisualScan, applyVisualToResult, persistLearnedRef } from "./visual";
 import {
   DAY_MS,
@@ -85,28 +102,49 @@ async function persistResult(
   await storage.set({ [`result_${tabId}`]: entry });
 }
 
-async function maybeAlert(result: AnalysisResult, settings: Settings): Promise<void> {
-  if (!settings.alertsEnabled || !settings.alertWebhookUrl) return;
-  if ((result.threat_score ?? 0) < settings.riskThreshold) return;
+/** What the options page shows to prove the webhook is really accepting events. */
+interface LastAlertRecord extends AlertDelivery {
+  url: string;
+  analysis_id: string;
+  threshold: number;
+  test: boolean;
+}
+
+/**
+ * Record the outcome of the most recent alert so the options page can answer
+ * "is my SOC actually receiving these?" instead of leaving the user to infer
+ * it from silence. Kept in storage (not a module variable) because a service
+ * worker restart would erase it.
+ */
+async function persistAlertDelivery(record: LastAlertRecord): Promise<void> {
   try {
-    await fetch(settings.alertWebhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        source: "phishbrain-extension",
-        detected_at: new Date().toISOString(),
-        analysis_id: result.analysis_id,
-        url: result.url,
-        domain: result.domain,
-        threat_score: result.threat_score,
-        risk_level: result.risk_level,
-        indicators: result.indicators?.slice(0, 12) ?? [],
-        recommended_action: result.recommended_action,
-      }),
-    });
+    await storage.set({ lastAlert: record });
   } catch {
-    // Alerting is best-effort and must never break scanning.
+    // Diagnostics must never break the delivery path that produced them.
   }
+}
+
+/**
+ * Opt-in SOC/SIEM alert for a finished analysis.
+ *
+ * The event is the backend's own SOC event where the analysis has one (see
+ * background/alerts.ts), delivered with a bounded timeout and one retry, and
+ * the outcome is recorded for the options page. Never throws.
+ */
+async function deliverAlert(
+  result: AnalysisResult,
+  settings: Settings,
+): Promise<AlertDelivery | null> {
+  if (!shouldSendAlert(result, settings)) return null;
+  const delivery = await sendSocAlert(settings.alertWebhookUrl, buildSocAlert(result));
+  await persistAlertDelivery({
+    ...delivery,
+    url: result.url,
+    analysis_id: result.analysis_id,
+    threshold: settings.riskThreshold,
+    test: false,
+  });
+  return delivery;
 }
 
 async function showBanner(
@@ -119,7 +157,10 @@ async function showBanner(
     await tabsApi.sendMessage(tabId, {
       type: "SHOW_BANNER",
       result,
-      dashboardUrl: settings.dashboardUrl,
+      // “View details” must not point at an undeployed placeholder; fall back to
+      // the local dashboard origin, which is where `npm run dev` serves it.
+      dashboardUrl:
+        configuredDashboardOrigin(settings.dashboardUrl) ?? DEFAULT_SETTINGS.dashboardUrl,
     });
   } catch {
     // content script may not be injected yet (e.g. chrome:// pages navigated away); ignore.
@@ -135,19 +176,21 @@ async function notifyHighRisk(
   tabId: number,
   result: AnalysisResult,
   settings: Settings,
+  /** "message" on a mailbox, so the alert names the right thing. */
+  subject: "page" | "message" = "page",
 ): Promise<void> {
   if (settings.bannerMode === "silent") return;
   if (result.risk_level !== "HIGH_RISK") return;
   const key = `${tabId}:${result.url}`;
   if (notifiedKeys.has(key)) return;
   notifiedKeys.add(key);
-  const host = result.domain || result.url || "this page";
+  const host = result.domain || result.url || `this ${subject}`;
   const lead = result.indicators?.[0] ?? "Multiple phishing indicators were detected.";
   try {
     await notificationsApi.create({
       type: "basic",
       iconUrl: runtimeApi.getURL("icons/icon128.png"),
-      title: `PhishBrain: high-risk page (${Math.round(result.threat_score)}/100)`,
+      title: `PhishBrain: high-risk ${subject} (${Math.round(result.threat_score)}/100)`,
       message: `${host} — ${lead}`,
     });
   } catch {
@@ -182,23 +225,83 @@ async function applyVisualRetention(force = false): Promise<number> {
 }
 
 /**
+ * Send the in-message verdict card to a mailbox tab.
+ *
+ * The alert outcome is a separate argument because it arrives after the scan:
+ * the card is shown straight away with "sending…" and is replaced by the same
+ * card with the delivery result a moment later, so a slow webhook never delays
+ * the verdict.
+ */
+async function showMailVerdict(
+  tabId: number,
+  result: AnalysisResult,
+  settings: Settings,
+  alert: AlertDelivery | null,
+  provider: string,
+): Promise<void> {
+  try {
+    await tabsApi.sendMessage(tabId, {
+      type: "SHOW_MAIL_VERDICT",
+      result,
+      provider,
+      alert,
+      alertConfigured: Boolean(settings.alertWebhookUrl.trim()),
+      dashboardUrl: configuredDashboardOrigin(settings.dashboardUrl) ?? DEFAULT_SETTINGS.dashboardUrl,
+    });
+  } catch {
+    // No content script (the tab navigated away from the mailbox) — the badge
+    // and the popup still carry the result.
+  }
+}
+
+interface FinalizeOptions {
+  /**
+   * Set for a mailbox scan. Enables the in-message verdict card, and replaces
+   * the page-level warning banner, which on Gmail covered the message header
+   * and offered "Proceed anyway" — an action that would allowlist the mailbox
+   * itself. The card is the alert on a mailbox.
+   */
+  mailCard?: { provider: string };
+}
+
+/**
  * Single funnel for every completed scan: persist the cache, update the
- * toolbar badge, fire the opt-in webhook and show the warning banner.
+ * toolbar badge, fire the opt-in webhook and show the warning banner (or, on a
+ * mailbox, the in-message verdict card).
  */
 async function finalizeScan(
   tabId: number,
   url: string,
   result: AnalysisResult,
   settings: Settings,
+  options: FinalizeOptions = {},
 ): Promise<AnalysisResult> {
   const normalized = normalizeResult(result);
   await persistResult(tabId, normalized, {
     storeImages: shouldStoreImages(settings.visualRetentionDays),
   });
   await setBadge(tabId, badgeForResult(normalized));
-  void maybeAlert(normalized, settings);
-  void notifyHighRisk(tabId, normalized, settings);
-  await showBanner(tabId, normalized, settings);
+
+  const isMail = Boolean(options.mailCard);
+  void notifyHighRisk(tabId, normalized, settings, isMail ? "message" : "page");
+  if (!isMail) await showBanner(tabId, normalized, settings);
+
+  // Alerting runs last and unawaited so a slow webhook never delays the badge,
+  // banner or the response the popup is waiting on. It is safe to leave in
+  // flight: delivery is bounded to two 4-second attempts, and Chrome only
+  // tears a worker down when a fetch response takes longer than 30 seconds.
+  // Awaiting it here would instead stall every scan on a misconfigured URL.
+  const alertPromise = deliverAlert(normalized, settings);
+  if (options.mailCard) {
+    const provider = options.mailCard.provider;
+    void showMailVerdict(tabId, normalized, settings, null, provider);
+    void alertPromise.then((delivery) =>
+      showMailVerdict(tabId, normalized, settings, delivery, provider),
+    );
+  } else {
+    void alertPromise;
+  }
+
   // Lazy enforcement of the evidence-retention policy (throttled internally).
   void applyVisualRetention();
   return normalized;
@@ -238,7 +341,7 @@ async function runVisualIfEnabled(
         visualAt: Date.now(),
       });
       await setBadge(tabId, badgeForResult(merged));
-      void maybeAlert(merged, settings);
+      void deliverAlert(merged, settings);
       void notifyHighRisk(tabId, merged, settings);
       await showBanner(tabId, merged, settings);
     }
@@ -252,12 +355,57 @@ async function runVisualIfEnabled(
   return attach();
 }
 
-async function analyzeWithFallback(url: string, settings: Settings): Promise<AnalysisResult> {
+interface ScanDepth {
+  /** Run the local LLM verdict — the slowest layer on CPU hardware. */
+  useLlm?: boolean;
+  /** Ask the backend to fetch and screenshot the page (the visual layer). */
+  fetchPage?: boolean;
+}
+
+/**
+ * Run `attempt` against the self-hosted engine, trying every candidate base.
+ *
+ * `backendCandidates` returns the configured address first and loopback second,
+ * so a build that ships a public API origin still uses the FastAPI stack when
+ * one is running on this computer. A server that *answered* with an error is
+ * deliberately not retried elsewhere: it is reachable, and its HTTP status is
+ * the real problem — retrying would hide a 500 behind "no local backend".
+ */
+async function withLocalBackend<T>(
+  settings: Settings,
+  attempt: (baseUrl: string) => Promise<T>,
+): Promise<T> {
+  let lastError: unknown;
+  for (const baseUrl of backendCandidates(settings.backendUrl)) {
+    try {
+      return await attempt(baseUrl);
+    } catch (err) {
+      lastError = err;
+      if (err instanceof ApiError && (err.code === "HTTP_ERROR" || err.code === "PARSE_ERROR")) {
+        throw err;
+      }
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new ApiError("BACKEND_UNAVAILABLE", "No local backend is running.");
+}
+
+async function analyzeWithFallback(
+  url: string,
+  settings: Settings,
+  depth: ScanDepth = {},
+): Promise<AnalysisResult> {
   try {
-    return await analyzeUrl({ url }, settings.backendUrl);
+    return await withLocalBackend(settings, (baseUrl) =>
+      analyzeUrl(
+        { url, fetch_page: depth.fetchPage ?? true, use_llm: depth.useLlm ?? true },
+        baseUrl,
+      ),
+    );
   } catch (err) {
     if (!settings.useCloudFallback) throw err;
-    return await analyzeUrlCloud({ url }, settings.cloudScanUrl);
+    return await analyzeUrlCloud({ url }, resolveHostedScan(settings).url);
   }
 }
 
@@ -267,13 +415,15 @@ async function analyzePageWithFallback(
   settings: Settings,
 ): Promise<AnalysisResult> {
   try {
-    return await analyzePage({ url, dom_summary: JSON.stringify(summary) }, settings.backendUrl);
+    return await withLocalBackend(settings, (baseUrl) =>
+      analyzePage({ url, dom_summary: JSON.stringify(summary) }, baseUrl),
+    );
   } catch (err) {
     if (!settings.useCloudFallback) throw err;
     // The hosted scan re-fetches the page itself, so a URL scan is the
     // closest fallback; client-side summary evidence is preserved nowhere but
     // the hosted fetch already covers the same webpage signals.
-    return await analyzeUrlCloud({ url }, settings.cloudScanUrl);
+    return await analyzeUrlCloud({ url }, resolveHostedScan(settings).url);
   }
 }
 
@@ -286,26 +436,34 @@ async function analyzeEmailWithFallback(
     subject?: string;
     body_text?: string;
     links?: string[];
+    has_attachments?: boolean;
+    has_quoted_content?: boolean;
     spf?: string;
     dkim?: string;
     dmarc?: string;
   },
   settings: Settings,
+  depth: ScanDepth = {},
 ): Promise<AnalysisResult> {
   try {
-    return await analyzeEmail(
-      {
-        sender: email.sender,
-        reply_to: email.reply_to,
-        display_name: email.display_name,
-        subject: email.subject,
-        body_text: email.body_text,
-        links: email.links,
-        spf: email.spf,
-        dkim: email.dkim,
-        dmarc: email.dmarc,
-      },
-      settings.backendUrl,
+    return await withLocalBackend(settings, (baseUrl) =>
+      analyzeEmail(
+        {
+          sender: email.sender,
+          reply_to: email.reply_to,
+          display_name: email.display_name,
+          has_attachments: email.has_attachments,
+          has_quoted_content: email.has_quoted_content,
+          subject: email.subject,
+          body_text: email.body_text,
+          links: email.links,
+          spf: email.spf,
+          dkim: email.dkim,
+          dmarc: email.dmarc,
+          use_llm: depth.useLlm ?? true,
+        },
+        baseUrl,
+      ),
     );
   } catch (err) {
     if (!settings.useCloudFallback) throw err;
@@ -317,13 +475,66 @@ async function analyzeEmailWithFallback(
         subject: email.subject,
         body_text: email.body_text,
         links: email.links,
+        has_attachments: email.has_attachments,
+        has_quoted_content: email.has_quoted_content,
       },
-      settings.cloudEmailScanUrl,
+      resolveHostedEmail(settings).url,
     );
   }
 }
 
+/**
+ * Make sure a tab has a live content script, injecting it when it does not.
+ *
+ * The ping is the test: a page with the script answers it, a page without one
+ * rejects with “Could not establish connection”. Injection is then a no-op for
+ * the page's own state — the script reads the DOM, it does not restart the page.
+ */
+async function ensureContentScript(tabId: number): Promise<boolean> {
+  try {
+    await tabsApi.sendMessage(tabId, { type: "PING" });
+    return true;
+  } catch {
+    /* no listener in that tab yet */
+  }
+  try {
+    await scriptingApi.executeScript({ target: { tabId }, files: ["content.js"] });
+    return true;
+  } catch {
+    // Restricted page (about:, add-on manager, PDF viewer): nothing to inject.
+    return false;
+  }
+}
+
+/**
+ * Per-tab sequence for mailbox scans. The content script deliberately reports
+ * the open message again and again (new message, refresh, focus, Rescan), and
+ * a full pass can take a minute on CPU hardware: without this token a slow
+ * scan of the message the user already left would finish last and replace the
+ * newer message's card, badge, alert and stored result with its own.
+ */
+const emailScanTokens = new Map<number, number>();
+
+/** A scan already running for a tab, so the same navigation cannot start two. */
+const scansInFlight = new Map<number, string>();
+/** Bumped per scan; a superseded scan must not write over a newer result. */
+const scanTokens = new Map<number, number>();
+
 async function scanTab(tabId: number, url: string, force = false) {
+  // A mailbox tab belongs to the message, not to the provider's UI: the content
+  // script reports the open email, and this URL scan would either duplicate that
+  // (racing it for the same badge and banner) or report “Google Mail” as the
+  // finding. Nothing is set here — the email path owns the tab.
+  if (isMailProviderUrl(url)) {
+    // Firefox only injects declared content scripts into pages loaded *after*
+    // the add-on is installed or reloaded. A Gmail tab that was already open
+    // therefore has no listener: the mailbox reports nothing, "Rescan" sends
+    // REPARSE_EMAIL into the void, and the popup answers “No scan result yet
+    // for this tab” forever. Make sure the script is there.
+    await ensureContentScript(tabId);
+    return;
+  }
+
   const settings = await getSettings();
   if (!force && !shouldScanUrl(url, settings)) {
     await setBadge(tabId, badgeForResult(null));
@@ -336,14 +547,91 @@ async function scanTab(tabId: number, url: string, force = false) {
     return;
   }
 
+  // A full navigation reports both a URL change and `status: complete`, so the
+  // same scan would otherwise be started twice and race itself for the badge.
+  if (!force && scansInFlight.get(tabId) === url) return;
+  scansInFlight.set(tabId, url);
+
+  const token = (scanTokens.get(tabId) ?? 0) + 1;
+  scanTokens.set(tabId, token);
+  const current = () => scanTokens.get(tabId) === token;
+
   try {
+    // Phase 1 — deterministic layers only: no page fetch and no model. On
+    // CPU-only hardware the full pipeline needs 40–60 s, nearly all of it
+    // inside llama.cpp, and waiting for that made the popup look stuck. This
+    // lands in about a second and is labelled provisional; phase 2 replaces it.
+    try {
+      const quick = await analyzeWithFallback(url, settings, { useLlm: false, fetchPage: false });
+      if (!current()) return;
+      const provisional: AnalysisResult = { ...quick, provisional: true };
+      await persistResult(tabId, provisional, { storeImages: false });
+      await setBadge(tabId, badgeForResult(provisional));
+    } catch {
+      // A failed quick pass is not fatal — phase 2 may still succeed through
+      // the hosted fallback, and it owns the unavailable state.
+    }
+
+    // Phase 2 — page fetch, screenshot comparison and the local LLM verdict.
+    // Only this phase alerts, notifies or shows a banner, so a provisional
+    // score can never fire a webhook or a warning the final verdict would not.
     const result = await analyzeWithFallback(url, settings);
+    if (!current()) return;
     const finalResult = await finalizeScan(tabId, url, result, settings);
     // Delay the screenshot slightly so the page has visually settled.
     await runVisualIfEnabled(tabId, url, finalResult, settings, 1200);
   } catch {
-    await setBadge(tabId, badgeForUnavailable());
+    if (current()) await setBadge(tabId, badgeForUnavailable());
+  } finally {
+    if (scansInFlight.get(tabId) === url) scansInFlight.delete(tabId);
   }
+}
+
+/**
+ * "Rescan" for a tab.
+ *
+ * On a mailbox this asks the content script to re-read the open message (the
+ * background deliberately does not scan the mail UI as a website) and waits for
+ * that new verdict, so the button is not a no-op on Gmail. Everywhere else it
+ * is the ordinary forced URL scan.
+ */
+async function rescanTab(tabId: number, url: string): Promise<AnalysisResult | null> {
+  if (!isMailProviderUrl(url)) {
+    await scanTab(tabId, url, true);
+    const entry = tabCache.get(tabId);
+    return entry ? entry.result : null;
+  }
+
+  const MESSAGE_WAIT_MS = 20 * 1000;
+  const POLL_MS = 250;
+  const requestedAt = Date.now();
+  // Inject first when the tab predates the add-on: without this the REPARSE
+  // message had no receiver and the button silently did nothing on Gmail.
+  await ensureContentScript(tabId);
+  try {
+    const reply = await tabsApi.sendMessage<{ type: string }, { ok?: boolean }>(tabId, {
+      type: "REPARSE_EMAIL",
+    });
+    // `ok: false` means no message is open (inbox list, search results): there
+    // is no verdict coming, so answer with whatever is cached instead of
+    // leaving the popup spinning for twenty seconds.
+    if (reply && reply.ok === false) {
+      const entry = tabCache.get(tabId);
+      return entry ? entry.result : null;
+    }
+  } catch {
+    // No content script in that tab (e.g. it is not a mailbox page any more).
+  }
+
+  for (;;) {
+    const entry = tabCache.get(tabId);
+    if (entry && entry.cachedAt > requestedAt) return entry.result;
+    if (Date.now() - requestedAt > MESSAGE_WAIT_MS) break;
+    await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+  }
+
+  const entry = tabCache.get(tabId);
+  return entry ? entry.result : null;
 }
 
 /** Visual-only pass for a tab that already has a fresh scan in cache. */
@@ -359,22 +647,62 @@ async function attachVisualToCachedTab(tabId: number, url: string | undefined) {
 tabsApi.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === "complete" && tab.url) {
     void scanTab(tabId, tab.url);
+    return;
   }
+  // Single-page apps swap the URL without ever firing another "complete" —
+  // YouTube, X, GitHub and most dashboards do exactly that. Listening only for
+  // "complete" left the tab showing the verdict of the page it first loaded,
+  // and made "Rescan" the only way to analyse anything after the first view.
+  if (changeInfo.url) void scanTab(tabId, changeInfo.url);
 });
 
 tabsApi.onActivated.addListener((activeInfo) => {
   void (async () => {
     try {
       const tab = await tabsApi.get(activeInfo.tabId);
-      void attachVisualToCachedTab(activeInfo.tabId, tab.url);
+      if (tab.url) {
+        // A background tab is re-analysed when the user comes back to it: the
+        // cache is trusted for five minutes, so a page left open for an hour is
+        // refreshed on the next activation instead of showing a stale verdict.
+        void scanTab(activeInfo.tabId, tab.url);
+        void attachVisualToCachedTab(activeInfo.tabId, tab.url);
+      }
     } catch {
       /* ignore */
     }
   })();
 });
 
+/**
+ * Scan whatever is in front of the user right now.
+ *
+ * Runs when the browser starts and when the extension is first installed or
+ * updated. Without it, every tab that was already open when the add-on loaded
+ * had no cached result, and the popup answered “No scan result yet for this
+ * tab” until the user pressed Rescan.
+ */
+async function scanActiveTab(): Promise<void> {
+  try {
+    const [tab] = await tabsApi.query({ active: true, currentWindow: true });
+    if (tab && typeof tab.id === "number" && tab.url) await scanTab(tab.id, tab.url);
+  } catch {
+    /* best effort: a browser without a focused window is not an error */
+  }
+}
+
+runtimeApi.onStartup.addListener(() => void scanActiveTab());
+runtimeApi.onInstalled.addListener(() => void scanActiveTab());
+
+// Keep the page in front of the user analysed instead of analysing it once and
+// trusting that verdict forever. `scanTab` is cache-aware (five-minute TTL), so
+// this re-runs the pipeline at most once per TTL and never on every tick.
+// Mailboxes are skipped here — their content script re-reads the open message.
+const ACTIVE_RESCAN_MS = 5 * 60 * 1000;
+setInterval(() => void scanActiveTab(), ACTIVE_RESCAN_MS);
+
 tabsApi.onRemoved.addListener((tabId) => {
   tabCache.delete(tabId);
+  emailScanTokens.delete(tabId);
   void storage.remove(`result_${tabId}`);
 });
 
@@ -393,10 +721,7 @@ runtimeApi.onMessage.addListener((raw, sender, sendResponse) => {
   }
 
   if (message.type === "RESCAN") {
-    scanTab(message.tabId, message.url, true).then(() => {
-      const entry = tabCache.get(message.tabId);
-      sendResponse(entry ? entry.result : null);
-    });
+    rescanTab(message.tabId, message.url).then((result) => sendResponse(result));
     return true;
   }
 
@@ -435,15 +760,52 @@ runtimeApi.onMessage.addListener((raw, sender, sendResponse) => {
       sendResponse(null);
       return true;
     }
+    // A newer report for this tab supersedes every scan already in flight.
+    const token = (emailScanTokens.get(tabId) ?? 0) + 1;
+    emailScanTokens.set(tabId, token);
+    const current = () => emailScanTokens.get(tabId) === token;
+
     getSettings().then(async (settings) => {
+      const provider = (() => {
+        try {
+          return mailProviderFor(new URL(message.url).hostname);
+        } catch {
+          return "unknown";
+        }
+      })();
       try {
+        // Quick deterministic pass first: the email layer is sub-second, so the
+        // card can appear while the local model is still thinking. Alerts and
+        // the final badge belong to the full pass below.
+        try {
+          const quick = await analyzeEmailWithFallback(message.url, message.email, settings, {
+            useLlm: false,
+          });
+          if (!current()) return;
+          const provisional: AnalysisResult = { ...quick, provisional: true };
+          await persistResult(tabId, provisional, { storeImages: false });
+          await setBadge(tabId, badgeForResult(provisional));
+          await showMailVerdict(tabId, provisional, settings, null, provider);
+        } catch {
+          // A failed quick pass is not fatal; the full pass owns the error state.
+        }
+
         const result = await analyzeEmailWithFallback(message.url, message.email, settings);
+        // Superseded while the model was thinking: this verdict belongs to a
+        // message that is no longer open, so it must not touch the tab.
+        if (!current()) {
+          sendResponse(null);
+          return;
+        }
         // Email results are not screenshotted; the visual pass is only for
-        // websites. Banner + badge still apply (sender impersonation etc.).
-        const finalResult = await finalizeScan(tabId, message.url, result, settings);
+        // websites. The verdict is delivered as an in-message card plus the
+        // toolbar badge, and the SOC webhook fires from the same funnel.
+        const finalResult = await finalizeScan(tabId, message.url, result, settings, {
+          mailCard: { provider },
+        });
         sendResponse(finalResult);
       } catch {
-        await setBadge(tabId, badgeForUnavailable());
+        if (current()) await setBadge(tabId, badgeForUnavailable());
         sendResponse(null);
       }
     });
@@ -468,6 +830,47 @@ runtimeApi.onMessage.addListener((raw, sender, sendResponse) => {
       } catch {
         sendResponse({ cleared: 0 });
       }
+    })();
+    return true;
+  }
+
+  if (message.type === "LAST_ALERT") {
+    void (async () => {
+      try {
+        const stored = await storage.get<{ lastAlert?: LastAlertRecord }>("lastAlert");
+        sendResponse(stored.lastAlert ?? null);
+      } catch {
+        sendResponse(null);
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "TEST_ALERT") {
+    void (async () => {
+      const settings = await getSettings();
+      const webhook = settings.alertWebhookUrl.trim();
+      if (!webhook) {
+        sendResponse({
+          delivered: false,
+          status: null,
+          attempts: 0,
+          error: "No alert webhook URL is set.",
+          at: Date.now(),
+        });
+        return;
+      }
+      // Sent even when the alerts toggle is off: this button exists precisely
+      // to check a URL before trusting it, and it is the user's own endpoint.
+      const delivery = await sendSocAlert(webhook, buildTestAlert());
+      await persistAlertDelivery({
+        ...delivery,
+        url: "https://phishbrain-test.example/login/verify",
+        analysis_id: "test-alert",
+        threshold: settings.riskThreshold,
+        test: true,
+      });
+      sendResponse(delivery);
     })();
     return true;
   }

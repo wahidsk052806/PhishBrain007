@@ -151,6 +151,27 @@ describe("PopupReport", () => {
     expect(noShot).not.toContain("<img");
   });
 
+  it("labels a provisional result so a quick verdict is not read as final", () => {
+    const quick = renderToStaticMarkup(<PopupReport result={sample({ provisional: true })} />);
+    expect(quick).toContain("Quick verdict");
+    expect(quick).toContain("still running");
+
+    // A finished result carries no such label.
+    expect(html).not.toContain("Quick verdict");
+  });
+
+  it("does not report the model and screenshot layers as missing while they are pending", () => {
+    // The quick pass deliberately runs no model and captures no page, so its
+    // result carries neither field — which is exactly what the popup receives
+    // in the seconds before the full pass lands.
+    const quick = renderToStaticMarkup(
+      <PopupReport result={sample({ provisional: true, llm_assessment: null, visual: null })} />,
+    );
+    expect(quick).not.toContain("No LLM reasoning layer was applied");
+    expect(quick).not.toContain("Unavailable for this result");
+    expect(quick).toContain("Still running");
+  });
+
   it("flags demo results so a synthetic verdict is never mistaken for live", () => {
     const demo = renderToStaticMarkup(<PopupReport result={sample({ demo: true })} />);
     expect(demo).toContain("Demo data");

@@ -31,7 +31,12 @@ export interface VisualEvidence {
 }
 
 export interface LLMAssessment {
-  status: "ok" | "unavailable" | "fallback";
+  /**
+   * `skipped` is a deliberate decision, not a fault: the deterministic layers
+   * already fixed the verdict, so the model's bounded adjustment could not have
+   * changed it and its CPU time was not spent. See `llm.not_needed`.
+   */
+  status: "ok" | "unavailable" | "fallback" | "skipped";
   model: string | null;
   classification: "safe" | "suspicious" | "high_risk" | null;
   confidence: number | null;
@@ -140,10 +145,21 @@ export interface AnalysisResult {
   provisional?: boolean;
 }
 
+/**
+ * `/api/v1/health` as the backend actually answers it.
+ *
+ * The old shape (`version` + a `components` map) never matched the API, so the
+ * badge could only ever read `status` — the one field that says "degraded"
+ * without saying which subsystem was down.
+ */
 export interface HealthStatus {
   status: "ok" | "degraded";
-  version: string;
-  components: Record<string, "ok" | "unavailable" | string>;
+  ollama: string;
+  database: string;
+  cache: string;
+  app_env: string;
+  database_backend?: string;
+  cache_backend?: string;
 }
 
 export const RISK_LABEL: Record<RiskLevel, string> = {

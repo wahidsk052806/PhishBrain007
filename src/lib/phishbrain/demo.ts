@@ -350,7 +350,14 @@ export interface DemoPageContext {
   form_action_external?: boolean;
   iframe_count?: number;
   external_script_domains?: number;
+  /** Brands the visible text mentions — reported, not scored. */
   brand_mentions?: string[];
+  /**
+   * Brands the title or a top-level heading claims to be. When present (the
+   * live scanner always sends it, even empty) it is the only thing scored; the
+   * synthetic demo fixtures predate it and fall back to their mentions.
+   */
+  brands_claimed?: string[];
   visual_similarity_score?: number;
   possible_brand?: string;
 }
@@ -390,10 +397,24 @@ function scorePageLayer(page: DemoPageContext | undefined, f: UrlFeatures): Laye
     indicators.push(`Scripts loaded from ${page.external_script_domains} external domains`);
     risk += 6;
   }
-  const brandMention = page.brand_mentions?.[0];
-  if (brandMention && !f.hostname.includes(brandMention)) {
+  // Impersonation is a claim, not a mention — the same rule the backend's
+  // webpage layer applies (`brands_claimed` vs `brand_mentions`). A page whose
+  // title says "PayPal" while hosted elsewhere is claiming to be PayPal; a page
+  // that merely links to PayPal is not. Scoring mentions is what flagged
+  // netflix.com for an `apple-touch-icon` tag in its markup.
+  const claims = page.brands_claimed ?? page.brand_mentions ?? [];
+  const claimedBrand = claims.find((brand) => !f.hostname.includes(brand));
+  // …and it must be collecting credentials. An encyclopaedia article titled
+  // "PayPal" is a page *about* PayPal, not a page pretending to be it; the
+  // backend applies the same two-condition rule (`brands_claimed and
+  // credential_fields`), so both engines agree instead of one of them flagging
+  // every article and download page that names a brand.
+  const collectsCredentials = Boolean(
+    page.has_password_field || page.has_otp_field || page.has_card_field,
+  );
+  if (claimedBrand && collectsCredentials) {
     indicators.push(
-      `Page presents the brand "${brandMention}" but is not served from that brand's domain`,
+      `Page presents itself as "${claimedBrand}" (title/heading) and asks for credentials, but is hosted on ${f.hostname}`,
     );
     risk += 20;
   }
@@ -408,7 +429,43 @@ export interface DemoEmailContext {
   display_name?: string;
   subject?: string;
   body?: string;
+  /** Plain hrefs, or `text|href` pairs when the caller also has the anchor text. */
   links?: string[];
+  /** Reported by the browser extension when the open message carries attachments. */
+  has_attachments?: boolean;
+  /**
+   * The sender quoted an earlier message and the extension scored only the new
+   * part. Recorded so the report states what was excluded instead of quietly
+   * scoring less of the message than the reader can see.
+   */
+  has_quoted_content?: boolean;
+}
+
+/**
+ * The visible text of a link compared against the domain it actually goes to —
+ * the classic "paypal.com" label pointing at `evil-collector.top`. Only the
+ * `text|href` pair form can express that, which is why the browser extension
+ * sends pairs rather than bare hrefs. Mirrors the backend rule
+ * (`app/analyzers/email/analyzer.py`) so both engines agree.
+ */
+function countMismatchedLinks(links: string[] | undefined): number {
+  let mismatched = 0;
+  for (const entry of links ?? []) {
+    const separator = entry.indexOf("|");
+    if (separator < 0) continue;
+    const textDomain = registrableDomain(entry.slice(0, separator));
+    const hrefDomain = registrableDomain(entry.slice(separator + 1));
+    if (textDomain && hrefDomain && textDomain !== hrefDomain) mismatched += 1;
+  }
+  return mismatched;
+}
+
+/** Best-effort registrable domain; empty when the text is not a host at all. */
+function registrableDomain(value: string): string {
+  const host = value.match(/(?:@|\/\/)?([\w-]+(?:\.[\w-]+)+)/)?.[1]?.toLowerCase();
+  if (!host) return "";
+  const parts = host.split(".");
+  return parts.length >= 2 ? parts.slice(-2).join(".") : host;
 }
 
 function scoreEmailLayer(email: DemoEmailContext | undefined): LayerEvidence {
@@ -451,6 +508,30 @@ function scoreEmailLayer(email: DemoEmailContext | undefined): LayerEvidence {
     );
     risk += 22;
   }
+  const mismatchedLinks = countMismatchedLinks(email.links);
+  if (mismatchedLinks) {
+    indicators.push(
+      `${mismatchedLinks} link(s) have visible text domain mismatched with actual href`,
+    );
+    risk += 20;
+  }
+  // Same condition as the backend: an attachment is only noteworthy next to
+  // pressure, credential-request or threat language — never on its own.
+  const pressureLanguage =
+    urgency.length > 0 ||
+    /(password|credential|verify your account|confirm your identity)/.test(body) ||
+    /(suspend|locked|legal action|penalty|unauthorized|final notice|wire transfer)/.test(body);
+  if (email.has_attachments && pressureLanguage) {
+    indicators.push("Attachment present alongside high-pressure/financial language");
+    risk += 8;
+  }
+  if (email.has_quoted_content) {
+    // Not a risk factor — the opposite: the quoted original (which may itself be
+    // the phishing email) was deliberately left out of the score above.
+    indicators.push(
+      "Quoted reply text and signature were excluded — only the new message was scored",
+    );
+  }
   if (!indicators.length) indicators.push("No sender or content anomalies detected");
   return {
     risk: Math.min(100, risk),
@@ -460,6 +541,9 @@ function scoreEmailLayer(email: DemoEmailContext | undefined): LayerEvidence {
       reply_to: email.reply_to ?? "unavailable",
       display_name: email.display_name ?? "unavailable",
       link_count: email.links?.length ?? 0,
+      mismatched_links: mismatchedLinks,
+      has_attachments: email.has_attachments ?? false,
+      quoted_content_excluded: email.has_quoted_content ?? false,
       spf: "Not available from browser context",
       dkim: "Not available from browser context",
       dmarc: "Not available from browser context",
@@ -706,7 +790,7 @@ export function analyzeDemo(
           possible_brand: null,
           visual_indicators: [
             live
-              ? "Screenshot / perceptual-hash comparison requires the Playwright backend; not run for this live scan."
+              ? "Screenshot / perceptual-hash comparison requires the Playwright backend, so it was not part of this scan. Start the backend, then press Rescan to include it."
               : "Screenshot capture requires the backend (Playwright); not available in demo mode",
           ],
         },

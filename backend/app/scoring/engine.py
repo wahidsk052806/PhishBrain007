@@ -19,19 +19,34 @@ LLM_ADJUSTMENT_CLAMP = 15.0
 
 
 def compute_layer_weighted_score(layers: list[LayerEvidence]) -> float:
+    """Weighted composite of the layers that describe the target.
+
+    Layers flagged `corroborative` (currently the destination of a link inside an
+    email) are evidence *about part of* the target, not a second view of it.
+    Averaging them in would pay for each extra view: a suspicious message whose
+    one link happened to be clean would score lower than the same message with
+    no link at all, so a 30/100 "verify your account" email would fall back under
+    the SAFE ceiling because its footer links to a bank. Corroborative evidence
+    can therefore only raise the score, using the same 90% rule that keeps a
+    confirmed typosquat from being averaged away.
+    """
     settings = get_settings()
     weights = settings.layer_weights
     available = [l for l in layers if not l.unavailable]
     if not available:
         return 0.0
-    weight_sum = sum(weights.get(l.layer, 0.0) for l in available) or 1.0
-    score = sum(weights.get(l.layer, 0.0) * l.risk_score for l in available) / weight_sum
+    core = [l for l in available if not l.details.get("corroborative")] or available
+    weight_sum = sum(weights.get(l.layer, 0.0) for l in core) or 1.0
+    score = sum(weights.get(l.layer, 0.0) * l.risk_score for l in core) / weight_sum
     # A single strong, high-confidence layer must not be averaged down by layers
     # that were merely neutral or missing. Floor the composite at 90% of the
     # strongest available layer so a confirmed typosquat stays HIGH_RISK even
     # when the page fetch or RDAP lookups fail.
-    max_layer = max((l.risk_score for l in available), default=0.0)
+    max_layer = max((l.risk_score for l in core), default=0.0)
     score = max(score, max_layer * 0.9)
+    for layer in available:
+        if layer.details.get("corroborative"):
+            score = max(score, layer.risk_score * 0.9)
     return max(0.0, min(100.0, score))
 
 
@@ -76,11 +91,20 @@ def classify_risk(score: float) -> RiskLevel:
     return RiskLevel.HIGH_RISK
 
 
+# `degraded` entries that describe a deliberate decision rather than a missing
+# layer. They are reported (the reader deserves to know the model was not asked)
+# but must not be charged as a loss of evidence: a scan that skipped a verdict
+# which provably could not change is not less trustworthy than one that paid
+# 20 s of CPU to hear the same answer.
+_DELIBERATE_SKIPS = frozenset({"llm.not_needed"})
+
+
 def compute_confidence(layers: list[LayerEvidence], llm: LLMAssessment | None, degraded: list[str]) -> float:
     total_layers = len(layers) or 1
     available_layers = len([l for l in layers if not l.unavailable])
     coverage = available_layers / total_layers
-    penalty = min(0.3, 0.05 * len(degraded))
+    faults = [code for code in degraded if code not in _DELIBERATE_SKIPS]
+    penalty = min(0.3, 0.05 * len(faults))
     llm_conf = llm.confidence if llm else 0.5
     confidence = 0.5 * coverage + 0.3 * llm_conf + 0.2 * (1 - penalty)
     return round(max(0.0, min(1.0, confidence)), 3)

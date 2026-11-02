@@ -163,6 +163,100 @@ def test_link_mismatch_is_detected_on_tlds_tldextract_cannot_resolve():
     assert evidence.details["mismatched_links"] == 1
 
 
+def test_newsletter_anchor_text_is_not_a_domain_mismatch():
+    """Prose labels must not be read as hostnames.
+
+    Regression: the real extension sends `text|href` pairs, so every newsletter
+    whose links were labelled "Join Superset" or "View in browser" produced a
+    mismatch for each link — and since that was the only signal a normal message
+    carried, unrelated emails all landed on the same 20/100.
+    """
+    payload = _clean()
+    payload["links"] = [
+        "Join Superset|https://joinsuperset.com/dashboard",
+        "View in browser|https://mail.joinsuperset.com/view/abc",
+        "Unsubscribe|https://joinsuperset.com/unsubscribe",
+    ]
+
+    evidence = analyze_email(**payload)
+
+    assert evidence.details["links_with_visible_text"] == 3
+    assert evidence.details["mismatched_links"] == 0
+    assert evidence.risk_score == 0.0
+    assert evidence.indicators == []
+
+
+def test_a_label_that_names_the_destination_domain_agrees():
+    payload = _clean()
+    payload["links"] = ["joinsuperset.com|https://joinsuperset.com/app"]
+
+    evidence = analyze_email(**payload)
+
+    assert evidence.details["mismatched_links"] == 0
+
+
+def test_the_mismatch_indicator_names_the_link_it_is_about():
+    payload = _clean()
+    payload["links"] = ["www.paypal.com|https://paypa1-support.top/login"]
+
+    evidence = analyze_email(**payload)
+
+    assert evidence.details["mismatched_link_examples"] == [
+        {"label": "www.paypal.com", "text_domain": "paypal.com", "href_domain": "paypa1-support.top"}
+    ]
+    assert any("paypa1-support.top" in i for i in evidence.indicators)
+
+
+def test_a_link_labelled_with_a_brand_domain_is_flagged_beyond_a_plain_mismatch():
+    """"You are going to paypal.com" is a stronger claim than a vague label.
+
+    Marketing copy disagrees with its own href often enough that a bare mismatch
+    stays below the SAFE ceiling; naming a protected brand's domain and pointing
+    somewhere else is the construction phishing kits actually use.
+    """
+    payload = _clean()
+    payload["links"] = ["www.paypal.com|https://example.com/login"]
+
+    evidence = analyze_email(**payload)
+
+    assert evidence.details["brand_labelled_links"] == 1
+    assert evidence.risk_score >= 30, evidence.risk_score
+    assert any("visible destination is not the real one" in i for i in evidence.indicators)
+
+
+def test_a_brand_label_is_recorded_even_when_the_first_three_mismatches_are_plain():
+    """The indicator names the brand link, not whichever mismatch came first."""
+    payload = _clean()
+    payload["links"] = [
+        "shop.example|https://a.example.com/1",
+        "help.example|https://b.example.com/2",
+        "news.example|https://c.example.com/3",
+        "www.paypal.com|https://evil-collector.top/login",
+    ]
+
+    evidence = analyze_email(**payload)
+
+    assert evidence.details["mismatched_links"] == 4
+    assert any("evil-collector.top" in i and "paypal.com" in i for i in evidence.indicators)
+
+
+def test_the_evidence_records_how_much_text_was_actually_scored():
+    """A clean verdict and an unexamined message must not look the same.
+
+    `body_chars` makes a parser that stops reaching the body visible in the
+    report instead of silently producing 0/100.
+    """
+    payload = _clean()
+    evidence = analyze_email(**payload)
+    assert evidence.details["body_chars"] == len(payload["body"])
+    assert evidence.notes is None
+
+    payload["body"] = "   "
+    evidence = analyze_email(**payload)
+    assert evidence.details["body_chars"] == 0
+    assert "No readable body text was supplied" in (evidence.notes or "")
+
+
 def test_plain_hrefs_without_text_are_skipped_not_miscounted():
     payload = _clean()
     payload["links"] = ["https://evil.tld/a", "https://evil.tld/b"]
@@ -185,6 +279,59 @@ def test_brand_mentioned_in_body_from_another_domain_is_flagged():
 # --------------------------------------------------------------------------- #
 # Attachments and authentication headers
 # --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# Quoted replies
+# --------------------------------------------------------------------------- #
+
+def test_excluding_a_quoted_reply_is_disclosed_but_never_scored():
+    """A reply to a phishing email must not be flagged for the message it quotes.
+
+    The extension sees the DOM, so it removes the quoted original and the
+    signature before sending the body, and sets `has_quoted_content`. That flag
+    is disclosure only: it must not add risk of its own.
+    """
+    payload = _clean()
+    payload["subject"] = "Re: Invoice question"
+    payload["body"] = "Thanks, I have forwarded this to security."
+    payload["has_quoted_content"] = True
+
+    evidence = analyze_email(**payload)
+
+    assert evidence.risk_score == 0.0
+    assert evidence.details["quoted_content_excluded"] is True
+    assert any("quoted reply" in i.lower() for i in evidence.indicators)
+
+
+def test_a_quoted_subject_is_still_scored():
+    """Deliberate: the disclosure is about the *body*, not the subject line.
+
+    A `Re:` subject is visible text on the message, and an attacker can fake a
+    thread continuation with one, so it stays in scope — only the quoted body is
+    excluded.
+    """
+    payload = _clean()
+    payload["subject"] = "Re: Your account will be suspended"
+    payload["body"] = "Thanks, I have forwarded this to security."
+
+    assert analyze_email(**{**payload, "has_quoted_content": True}).risk_score > 0
+
+
+def test_a_reply_is_scored_on_its_own_content_only():
+    payload = _clean()
+    payload["body"] = "Thanks, I have forwarded this to security."
+
+    with_flag = analyze_email(**{**payload, "has_quoted_content": True})
+    without_flag = analyze_email(**payload)
+
+    assert with_flag.risk_score == without_flag.risk_score
+
+
+def test_quoted_content_defaults_to_not_reported():
+    evidence = analyze_email(**_clean())
+
+    assert evidence.details["quoted_content_excluded"] is False
+
 
 def test_attachment_alone_is_not_treated_as_suspicious():
     payload = _clean()
@@ -250,3 +397,67 @@ def test_details_record_the_raw_hits_for_auditing():
     assert details["credential_hits"]
     # The registrable domain, not the full host.
     assert details["sender_domain"] == "example.com"
+
+
+# --------------------------------------------------------------------------- #
+# API: the `use_llm` fast path
+# --------------------------------------------------------------------------- #
+# Regression: `use_llm` was a field on the URL and page requests but not on the
+# email request, and the email route never passed `skip_llm`. A caller asking
+# for the deterministic layers still waited out the model's full budget, which
+# on a cold CPU is 150 s — indistinguishable from a hang.
+
+
+class _StubResult:
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def model_dump(self, mode: str = "python") -> dict:  # noqa: ARG002
+        return self._payload
+
+
+def test_email_request_accepts_use_llm_and_defaults_to_true():
+    from app.schemas.analysis import EmailAnalyzeRequest
+
+    assert EmailAnalyzeRequest(sender="a@b.example").use_llm is True
+    assert EmailAnalyzeRequest(sender="a@b.example", use_llm=False).use_llm is False
+
+
+def test_email_endpoint_passes_use_llm_false_as_skip_llm(client, monkeypatch):
+    from app.api.v1 import routes
+
+    seen: dict = {}
+
+    async def fake_run_analysis(input_type, target, **kwargs):  # noqa: ARG001
+        seen.update(kwargs)
+        return _StubResult({"analysis_id": "stub", "risk_level": "SAFE"})
+
+    monkeypatch.setattr(routes, "run_analysis", fake_run_analysis)
+
+    resp = client.post(
+        "/api/v1/analyze/email",
+        json={"sender": "billing@example.tld", "subject": "Hi", "body": "Hi", "use_llm": False},
+    )
+
+    assert resp.status_code == 200
+    assert seen["skip_llm"] is True
+
+
+def test_email_endpoint_runs_the_llm_by_default(client, monkeypatch):
+    from app.api.v1 import routes
+
+    seen: dict = {}
+
+    async def fake_run_analysis(input_type, target, **kwargs):  # noqa: ARG001
+        seen.update(kwargs)
+        return _StubResult({"analysis_id": "stub", "risk_level": "SAFE"})
+
+    monkeypatch.setattr(routes, "run_analysis", fake_run_analysis)
+
+    resp = client.post(
+        "/api/v1/analyze/email",
+        json={"sender": "billing@example.tld", "subject": "Hi", "body": "Hi"},
+    )
+
+    assert resp.status_code == 200
+    assert seen["skip_llm"] is False

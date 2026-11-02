@@ -12,7 +12,12 @@ from fastapi.responses import PlainTextResponse, StreamingResponse
 from app.cache.store import get_cache
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.core.security import SSRFBlockedError, guard_user_target
+from app.core.security import (
+    HostUnresolvedError,
+    SSRFBlockedError,
+    guard_user_target,
+    normalize_url_input,
+)
 from app.db.repository import (
     clear_history,
     clear_visual_evidence,
@@ -51,6 +56,16 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, default=str)}\n\n"
 
 
+def _unresolved_scan_target(raw: str, exc: HostUnresolvedError) -> str:
+    """The target to report for a host that has no DNS records.
+
+    Normalised the same way the guard would have, so the report names
+    `https://g0gle.com/` rather than the bare string that was typed — and so
+    the URL and LLM layers analyse a well-formed URL.
+    """
+    return normalize_url_input(raw) or f"https://{exc.hostname}"
+
+
 def _error_response(exc: Exception, status_code: int = 500) -> HTTPException:
     logger.error("API error", extra={"extra_fields": {"error": str(exc)}})
     return HTTPException(status_code=status_code, detail="An internal error occurred while processing the request.")
@@ -64,8 +79,16 @@ async def analyze_url_endpoint(payload: URLAnalyzeRequest):
         # A bare host (`hianime.to`) is a valid thing to type, so the target is
         # normalised to an absolute URL before the SSRF guard sees it. The
         # normalised form is what gets scanned and named in the report.
+        # A host that does not resolve is a finding, not a refusal: the name is
+        # unregistered, lapsed or mistyped, and PhishBrain can still report on
+        # the URL string, the registration lookup and the local model. Only a
+        # genuine guard decision (private address, bad scheme) is a 400.
+        unresolved_host = ""
         try:
             target, _ = guard_user_target(payload.url)
+        except HostUnresolvedError as exc:
+            target = _unresolved_scan_target(payload.url, exc)
+            unresolved_host = exc.hostname
         except SSRFBlockedError as exc:
             raise HTTPException(status_code=400, detail=f"URL rejected: {exc}") from exc
 
@@ -76,7 +99,8 @@ async def analyze_url_endpoint(payload: URLAnalyzeRequest):
             target,
             url=target,
             dom_summary=payload.dom_summary,
-            fetch_page_flag=payload.fetch_page,
+            fetch_page_flag=payload.fetch_page and not unresolved_host,
+            unresolved_host=unresolved_host or None,
             skip_llm=not payload.use_llm,
             raw_input=request_payload,
         )
@@ -114,8 +138,12 @@ async def analyze_url_stream_endpoint(payload: URLAnalyzeRequest):
 
             return StreamingResponse(demo_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
+        unresolved_host = ""
         try:
             target, _ = guard_user_target(payload.url)
+        except HostUnresolvedError as exc:
+            target = _unresolved_scan_target(payload.url, exc)
+            unresolved_host = exc.hostname
         except SSRFBlockedError as exc:
             raise HTTPException(status_code=400, detail=f"URL rejected: {exc}") from exc
 
@@ -139,7 +167,8 @@ async def analyze_url_stream_endpoint(payload: URLAnalyzeRequest):
                 target,
                 url=target,
                 dom_summary=payload.dom_summary,
-                fetch_page_flag=payload.fetch_page,
+                fetch_page_flag=payload.fetch_page and not unresolved_host,
+                unresolved_host=unresolved_host or None,
                 skip_llm=not payload.use_llm,
                 raw_input=request_payload,
                 on_event=on_event,
@@ -179,10 +208,15 @@ async def analyze_email_endpoint(payload: EmailAnalyzeRequest):
         if payload.demo:
             return build_demo_result("email", payload.sender)
 
+        # `use_llm: false` is part of the request model, so honour it here too:
+        # the URL and page endpoints already do, and a caller that explicitly
+        # asked for the deterministic layers should not wait out the model's
+        # 150 s budget (it read as a hang on a cold CPU).
         result = await run_analysis(
             "email",
             payload.sender,
             email_fields=payload.model_dump(),
+            skip_llm=not payload.use_llm,
             raw_input=payload.model_dump(),
         )
         return result
@@ -201,9 +235,16 @@ async def analyze_page_endpoint(payload: PageAnalyzeRequest):
         # URL is normalised exactly as the URL endpoint does, so a bare host
         # works here too.
         target = payload.url
+        unresolved_host = ""
         if not payload.html and payload.fetch_page:
             try:
                 target, _ = guard_user_target(payload.url)
+            except HostUnresolvedError as exc:
+                # Same treatment as the URL endpoint: an unresolved name is a
+                # finding, so the page scan reports what it can instead of
+                # refusing the request.
+                target = _unresolved_scan_target(payload.url, exc)
+                unresolved_host = exc.hostname
             except SSRFBlockedError as exc:
                 raise HTTPException(status_code=400, detail=f"URL rejected: {exc}") from exc
 
@@ -215,7 +256,8 @@ async def analyze_page_endpoint(payload: PageAnalyzeRequest):
             url=target,
             html=payload.html,
             dom_summary=payload.dom_summary,
-            fetch_page_flag=payload.fetch_page,
+            fetch_page_flag=payload.fetch_page and not unresolved_host,
+            unresolved_host=unresolved_host or None,
             screenshot_base64=payload.screenshot_base64,
             skip_llm=not payload.use_llm,
             raw_input=request_payload,

@@ -34,6 +34,14 @@ class EmailAnalyzeRequest(BaseModel):
     raw_headers: Optional[str] = Field(default=None, description="Raw email headers, if available")
     links: list[str] = Field(default_factory=list)
     has_attachments: bool = Field(default=False)
+    # Set by the browser extension when the sender quoted an earlier message and
+    # only the new part was sent for scoring. Recorded in the evidence so a
+    # report never silently scores less than the reader can see.
+    has_quoted_content: bool = Field(default=False)
+    # The same fast path the URL and page endpoints expose. A message can be
+    # triaged on its deterministic layers alone; without this field the flag was
+    # silently dropped and every email scan waited out the model.
+    use_llm: bool = Field(default=True, description="Run the local LLM assessment step")
     demo: bool = Field(default=False)
 
 

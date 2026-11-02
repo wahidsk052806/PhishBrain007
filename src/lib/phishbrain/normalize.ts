@@ -49,6 +49,30 @@ const NON_WEB_SCHEMES = [
  * Mirrors `normalize_url_input` in `backend/app/core/security.py`; the backend
  * normalises as well, because it must not depend on its callers for this.
  */
+/**
+ * The href out of a link entry.
+ *
+ * The browser extension sends mail links as `text|href` (the pair form the
+ * email layer compares so "paypal.com" rendered over `evil.top` is visible),
+ * while the dashboard's email form sends bare URLs. Both arrive here.
+ */
+export function hrefOfLink(entry: string): string {
+  const separator = entry.indexOf("|");
+  return (separator >= 0 ? entry.slice(separator + 1) : entry).trim();
+}
+
+/**
+ * The first entry that is a real web destination, hrefs unwrapped from the
+ * `text|href` pair form. Used to pick the one link a scan fetches live.
+ */
+export function firstHttpHref(links: readonly string[]): string | null {
+  for (const link of links) {
+    const href = hrefOfLink(link);
+    if (/^https?:\/\//i.test(href)) return href;
+  }
+  return null;
+}
+
 export function normalizeTargetInput(raw: string): string {
   if (typeof raw !== "string") return "";
   let text = raw.trim();
@@ -120,7 +144,15 @@ const DEGRADED_NOTES: Record<string, string> = {
   "llm.timeout":
     "Local LLM: the model did not answer within the scan deadline, so no model verdict was applied.",
   "llm.error": "Local LLM: the model call failed for this scan.",
+  "llm.busy":
+    "Local LLM: the server was already running as many model verdicts as its CPU can handle, so this scan finished without one. The score is from the deterministic layers.",
+  "llm.not_needed":
+    "Local LLM: not consulted — the deterministic layers already fixed this verdict, and the model's bounded adjustment could not have changed it. This saves the model's CPU time rather than reporting a fault.",
+  "visual.busy":
+    "Visual layer: the server's screenshot slots were busy with other scans, so this page was not rendered for the brand comparison.",
   "visual.error": "Visual brand-clone comparison failed for this scan.",
+  "visual.timeout":
+    "Visual layer: the page took longer to render than the screenshot budget, so no brand comparison was made.",
   "webpage.unavailable":
     "Webpage layer: no page content was available, so nothing was parsed for credential forms or brand mismatches.",
   "webpage.timeout": "Webpage layer: the page fetch exceeded its time budget.",
@@ -431,9 +463,12 @@ export function normalizeAnalysisResult(raw: unknown): AnalysisResult {
 
   const rawLlm = r.llm_assessment ?? undefined;
   const hasLlm = rawLlm !== undefined;
-  const llmFallback = degraded.some((d) => d.startsWith("llm."));
+  // A deliberate skip is not a fallback: the model was not asked because its
+  // answer could not change the verdict (see `llm.not_needed`).
+  const llmSkipped = degraded.includes("llm.not_needed");
+  const llmFallback = !llmSkipped && degraded.some((d) => d.startsWith("llm."));
   const llmAssessment: AnalysisResult["llm_assessment"] = {
-    status: hasLlm ? (llmFallback ? "fallback" : "ok") : "unavailable",
+    status: llmSkipped ? "skipped" : hasLlm ? (llmFallback ? "fallback" : "ok") : "unavailable",
     // Named by the backend when a real local model produced the verdict; null
     // when the deterministic fallback ran, which is then truthful.
     model: asString(rawLlm?.model, "") || null,

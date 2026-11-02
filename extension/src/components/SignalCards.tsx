@@ -112,7 +112,14 @@ export function PrefilterCard({ prefilter }: { prefilter?: PrefilterEvidenceWire
   );
 }
 
-export function LlmCard({ assessment }: { assessment?: Record<string, unknown> | null }) {
+export function LlmCard({
+  assessment,
+  pending = false,
+}: {
+  assessment?: Record<string, unknown> | null;
+  /** The quick verdict is still being replaced by the full pass. */
+  pending?: boolean;
+}) {
   if (!assessment) {
     return (
       <Section
@@ -120,7 +127,9 @@ export function LlmCard({ assessment }: { assessment?: Record<string, unknown> |
         subtitle="On-device reasoning (Ollama) — no data leaves the machine"
       >
         <p className="text-[11px] text-slate-400">
-          No LLM reasoning layer was applied to this result.
+          {pending
+            ? "Still running — this is the quick verdict. The on-device model's assessment arrives with the full pass and replaces this report in place."
+            : "No LLM reasoning layer was applied to this result."}
         </p>
       </Section>
     );
@@ -168,7 +177,14 @@ export function LlmCard({ assessment }: { assessment?: Record<string, unknown> |
   );
 }
 
-export function VisualCard({ visual }: { visual?: Record<string, unknown> | null }) {
+export function VisualCard({
+  visual,
+  pending = false,
+}: {
+  visual?: Record<string, unknown> | null;
+  /** The quick verdict is still being replaced by the full pass. */
+  pending?: boolean;
+}) {
   const status = asString(visual?.status) ?? "unavailable";
   const available = status === "ok" || status === "available";
   const similarity = asNumber(visual?.visual_similarity_score);
@@ -224,7 +240,12 @@ export function VisualCard({ visual }: { visual?: Record<string, unknown> | null
         />
       )}
       <dl className="flex flex-col gap-1">
-        <Row label="Status" value={available ? "Available" : "Unavailable for this result"} />
+        <Row
+          label="Status"
+          value={
+            available ? "Available" : pending ? "Still running" : "Unavailable for this result"
+          }
+        />
         {similarity !== null && (
           <Row label="Visual similarity" value={`${Math.round(similarity * 100)}%`} />
         )}

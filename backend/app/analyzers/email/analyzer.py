@@ -9,6 +9,16 @@ import tldextract
 from app.core.config import get_settings
 from app.schemas.analysis import LayerEvidence
 
+# Anchor text is ordinary language ("Join Superset", "View in browser"), so a
+# visible link is only treated as naming a destination when the text actually
+# contains a host — scheme optional, at least one dot, a letters-only TLD.
+# Without this guard every link in every newsletter was reported as a
+# text/href mismatch, which pinned unrelated messages to the same score.
+VISIBLE_HOST_RE = re.compile(
+    r"(?:https?://)?((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63})(?![\w-])",
+    re.IGNORECASE,
+)
+
 URGENCY_TERMS = ["urgent", "immediately", "act now", "expire", "within 24 hours", "final notice", "asap"]
 THREAT_TERMS = ["suspend", "terminate", "legal action", "penalty", "unauthorized access", "locked", "closed"]
 CREDENTIAL_TERMS = ["verify your account", "confirm your password", "login to continue", "reset your password", "update your billing"]
@@ -52,6 +62,25 @@ def _extract_domain(address: str) -> str:
     return ext.registered_domain or host
 
 
+def _domain_in_text(text: str) -> str:
+    """Registrable domain *named* in visible text, or "" when the text is prose.
+
+    The link-mismatch check compares the label a reader sees with the href it
+    really points at. Feeding the label to `_extract_domain` (which accepts any
+    string and falls back to the whole thing as a "host") turned "Join Superset"
+    into a host called `join superset`, so *every* link in *every* message was
+    counted as a mismatch and unrelated emails all landed on the same 20/100.
+    Prose therefore has to yield "" here — it is the absence of a claim, not a
+    conflicting one.
+    """
+    match = VISIBLE_HOST_RE.search(text or "")
+    if not match:
+        return ""
+    host = match.group(1).strip(".").lower()
+    ext = tldextract.extract(host)
+    return ext.registered_domain or host
+
+
 def _parse_auth_header(raw_headers: str | None, mechanism: str) -> str:
     if not raw_headers:
         return "Not available from browser context"
@@ -70,6 +99,7 @@ def analyze_email(
     links: list[str] | None = None,
     raw_headers: str | None = None,
     has_attachments: bool = False,
+    has_quoted_content: bool = False,
 ) -> LayerEvidence:
     settings = get_settings()
     links = links or []
@@ -109,16 +139,45 @@ def analyze_email(
     # "text|href" when the caller has both. Plain hrefs carry no text to compare
     # and are skipped.
     mismatched_links = 0
+    brand_labelled_links = 0
+    first_brand_mismatch: dict | None = None
+    links_with_text = 0
+    mismatches: list[dict] = []
     for link in links:
-        if "|" in link:
-            text_part, _, href_part = link.partition("|")
-            text_domain = _extract_domain(text_part)
-            href_domain = _extract_domain(href_part)
-            if text_domain and href_domain and text_domain != href_domain:
-                mismatched_links += 1
+        if "|" not in link:
+            continue
+        links_with_text += 1
+        text_part, _, href_part = link.partition("|")
+        text_domain = _domain_in_text(text_part)
+        href_domain = _extract_domain(href_part)
+        if text_domain and href_domain and text_domain != href_domain:
+            mismatched_links += 1
+            # A label that *names a brand's own domain* while the href goes
+            # elsewhere is the textbook phishing construction, and a stronger
+            # claim than a bare mismatch (which legitimate marketing copy also
+            # produces): the label asserts "you are going to paypal.com".
+            labelled_brand = next((b for b in settings.brands if b in text_domain), None)
+            if labelled_brand and labelled_brand not in href_domain:
+                brand_labelled_links += 1
+                if first_brand_mismatch is None:
+                    first_brand_mismatch = {"text_domain": text_domain, "href_domain": href_domain}
+            if len(mismatches) < 3:
+                mismatches.append(
+                    {"label": text_part.strip()[:120], "text_domain": text_domain, "href_domain": href_domain}
+                )
     if mismatched_links:
         score += 20
-        indicators.append(f"{mismatched_links} link(s) have visible text domain mismatched with actual href")
+        first = mismatches[0]
+        indicators.append(
+            f"{mismatched_links} link(s) have visible text domain mismatched with actual href "
+            f"(first: '{first['label']}' reads {first['text_domain']} but points at {first['href_domain']})"
+        )
+    if brand_labelled_links and first_brand_mismatch:
+        score += 12
+        indicators.append(
+            f"Link labelled as {first_brand_mismatch['text_domain']} points at "
+            f"{first_brand_mismatch['href_domain']} — the visible destination is not the real one"
+        )
 
     brand_domain_mismatch = False
     for brand in settings.brands:
@@ -133,6 +192,15 @@ def analyze_email(
         score += 8
         indicators.append("Attachment present alongside high-pressure/financial language")
 
+    # Not a risk signal: the caller (the browser extension, which can see the
+    # DOM) removed the quoted original and any signature before sending `body`,
+    # so a reply is not scored for the message it quotes. Stated explicitly so
+    # the report never implies it examined text it never saw.
+    if has_quoted_content:
+        indicators.append(
+            "A quoted reply and signature were excluded — only the new message was scored"
+        )
+
     spf = _parse_auth_header(raw_headers, "spf")
     dkim = _parse_auth_header(raw_headers, "dkim")
     dmarc = _parse_auth_header(raw_headers, "dmarc")
@@ -142,6 +210,17 @@ def analyze_email(
             indicators.append(f"{label} authentication failed")
 
     score = max(0.0, min(100.0, score))
+    body_chars = len((body or "").strip())
+    # Stated in the evidence, not scored: "this message was judged on its headers
+    # and links because no body text reached the backend" is the difference
+    # between a clean verdict and an unexamined one. A parser change that drops
+    # the body then shows up as 0 characters instead of as a silent 0/100.
+    notes = None
+    if body_chars == 0:
+        notes = (
+            "No readable body text was supplied, so only the subject, sender, headers and links "
+            "could be scored. If this message has a body, the page parser did not reach it."
+        )
     details = {
         "sender_domain": sender_domain,
         "reply_to_domain": reply_domain,
@@ -151,10 +230,24 @@ def analyze_email(
         "financial_hits": financial_hits,
         "prize_hits": prize_hits,
         "mismatched_links": mismatched_links,
+        "brand_labelled_links": brand_labelled_links,
+        "mismatched_link_examples": mismatches,
+        "links_total": len(links),
+        "links_with_visible_text": links_with_text,
+        "body_chars": body_chars,
+        "subject_chars": len((subject or "").strip()),
         "brand_domain_mismatch": brand_domain_mismatch,
         "spf": spf,
         "dkim": dkim,
         "dmarc": dmarc,
         "has_attachments": has_attachments,
+        "quoted_content_excluded": has_quoted_content,
     }
-    return LayerEvidence(layer="email", risk_score=score, indicators=indicators, details=details, unavailable=False)
+    return LayerEvidence(
+        layer="email",
+        risk_score=score,
+        indicators=indicators,
+        details=details,
+        unavailable=False,
+        notes=notes,
+    )

@@ -1,18 +1,37 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FlaskConical, Loader2, Mail, ScanSearch } from "lucide-react";
 import { AppShell } from "@/components/phishbrain/AppShell";
 import { AnalysisReport } from "@/components/phishbrain/AnalysisReport";
 import { api, BackendRejectedError, BackendUnavailableError } from "@/lib/phishbrain/api";
 import { analyzeDemo, DEMO_SAMPLES, saveDemoAnalysis } from "@/lib/phishbrain/demo";
 import { normalizeTargetInput } from "@/lib/phishbrain/normalize";
+import { resolveBackendEndpoint } from "@/lib/phishbrain/backend-endpoint";
 import type { DemoSample } from "@/lib/phishbrain/demo";
 import { liveAnalyzeUrl, liveAnalyzeEmail } from "@/lib/phishbrain/scan.functions";
 import type { AnalysisResult } from "@/lib/phishbrain/types";
+import { useBackendEndpoint } from "@/lib/phishbrain/useBackendEndpoint";
 import { usePhishbrainSettings } from "@/lib/phishbrain/usePhishbrainSettings";
 
 export const Route = createFileRoute("/analysis/")({
+  /**
+   * `?url=<target>` deep link.
+   *
+   * The browser extension and its in-page banners link here after a scan, so
+   * "Open Dashboard" lands on a *report* rather than an empty form. The target
+   * is re-scanned through whichever engine this browser can reach, which means
+   * the extension's verdict is reproduced (and completed) with the backend's
+   * screenshot, CatBoost pre-filter and LLM layers instead of only the reduced
+   * client-side evidence.
+   */
+  validateSearch: (search: Record<string, unknown>): { url?: string } => {
+    const raw = search["url"];
+    const url = typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+    // `exactOptionalPropertyTypes` is on, so an absent parameter is `{}`, not
+    // `{ url: undefined }`.
+    return url === undefined ? {} : { url };
+  },
   head: () => ({
     meta: [
       { title: "Analyze a URL — PhishBrain" },
@@ -33,7 +52,9 @@ export const Route = createFileRoute("/analysis/")({
 });
 
 function AnalyzePage() {
+  const { url: linkedUrl } = Route.useSearch();
   const { settings } = usePhishbrainSettings();
+  const { resolution, refresh: refreshBackend } = useBackendEndpoint();
   const navigate = useNavigate();
   const scanLive = useServerFn(liveAnalyzeUrl);
   const scanEmail = useServerFn(liveAnalyzeEmail);
@@ -117,63 +138,101 @@ function AnalyzePage() {
     setNotice(null);
     setResult(null);
 
+    // Which engine serves this browser is now measured rather than assumed: the
+    // endpoint probe tries the configured API and, when this page is served
+    // from a private network host, the same host on the backend port — so a
+    // dashboard opened over the LAN uses the backend with its CatBoost
+    // pre-filter, LLM verdict and screenshots instead of falling back to the
+    // server engine. If the probe has not finished yet, await it rather than
+    // guessing; the wait is bounded by the probe timeout.
+    // The cached answer can be up to a minute old (the probe is cached and
+    // refreshed on an interval). A backend started after this page loaded was
+    // therefore ignored for the rest of that window, and the scan silently lost
+    // the ML pre-filter, the LLM verdict and the screenshot layer — after which
+    // the report correctly says those layers were not applied, which reads as
+    // "visual analysis is broken". Re-probe once before falling back, so
+    // starting the backend is picked up by the next Rescan instead of by a
+    // page reload.
+    const cached = resolution ?? (await resolveBackendEndpoint(settings));
+    const endpoint =
+      cached.engine === "backend" ? cached : ((await refreshBackend()).data ?? cached);
+    const serverSide = endpoint.engine !== "backend";
+    let detail = "";
+
     // 1. Self-hosted FastAPI backend (full pipeline incl. Ollama + Playwright).
     // Streamed: the deterministic layers and the ML pre-filter land in a few
     // seconds and the report renders then, with the LLM verdict replacing it in
     // place when it arrives. Waiting for the whole pipeline meant ~40s of blank
     // screen for information that was already known after five.
-    try {
-      await api.analyzeUrlStream(target, {
-        onPartial: (partial) => setResult(partial),
-        onFinal: (final) => setResult(final),
-      });
-      setBusy(false);
-      return;
-    } catch (err) {
-      // The backend answered and refused the target (bad scheme, unresolvable
-      // host, a guard decision). That is an answer, not an outage: report the
-      // backend's own reason instead of silently re-scanning without the ML
-      // pre-filter, LLM reasoning or screenshot layers.
-      if (err instanceof BackendRejectedError) {
-        // A guard refusal is an answer, not an outage. An unresolvable host is
-        // the common case and has a concrete, user-fixable cause, so say that
-        // instead of quoting the raw guard message.
-        const unresolved = /DNS resolution failed for ([^\s:]+)/i.exec(err.detail);
-        setError(
-          unresolved
-            ? `This host does not resolve — the DNS lookup for ${unresolved[1]} failed, so nothing was fetched and no layer could be evaluated. Check the domain for typos: reserved documentation names such as example.org serve no subdomains, and unregistered domains answer nothing.`
-            : `The backend refused this target: ${err.detail} (HTTP ${err.status}). No report was produced — the request was stopped before any layer ran, and the built-in scanner is not used as a silent substitute because it cannot produce the ML pre-filter, LLM or visual evidence.`,
-        );
-        return;
-      }
-      const detail = err instanceof BackendUnavailableError ? err.detail : String(err);
-      // 2. Built-in live scan engine: real fetch, DNS, RDAP and DOM parsing.
+    if (!serverSide) {
       try {
-        const raw = await scanLive({
-          data: {
-            url: target,
-            safeThreshold: settings.safeThreshold,
-            suspiciousThreshold: settings.suspiciousThreshold,
-          },
+        await api.analyzeUrlStream(target, {
+          onPartial: (partial) => setResult(partial),
+          onFinal: (final) => setResult(final),
         });
-        const live = JSON.parse(raw as unknown as string) as AnalysisResult;
-        saveDemoAnalysis(live);
-        setResult(live);
-        setNotice(
-          `LIVE SCAN (REDUCED LAYERS) — the FastAPI backend could not be reached (${detail}), so this result came from the built-in scanner: real HTTP fetch, DNS, RDAP and DOM analysis. The ML pre-filter, LLM reasoning and screenshot/brand-clone layers all live in the backend, so none of them were applied to this score.`,
-        );
-      } catch (liveErr) {
-        const liveDetail = liveErr instanceof Error ? liveErr.message : String(liveErr);
-        if (settings.demoMode) {
-          const demo = analyzeDemo({ url: target });
-          saveDemoAnalysis(demo);
-          setResult(demo);
+        setBusy(false);
+        return;
+      } catch (err) {
+        // The backend answered and refused the target (bad scheme, unresolvable
+        // host, a guard decision). That is an answer, not an outage: report the
+        // backend's own reason instead of silently re-scanning without the ML
+        // pre-filter, LLM reasoning or screenshot layers.
+        if (err instanceof BackendRejectedError) {
+          // A guard refusal is an answer, not an outage. An unresolvable host is
+          // the common case and has a concrete, user-fixable cause. A current
+          // backend reports it as a normal verdict (see the API's
+          // `HostUnresolvedError` handling), so reaching here means the backend
+          // is an older build: say that plainly and without an error tone, since
+          // nothing is broken on this side.
+          const unresolved = /DNS resolution failed for ([^\s:]+)/i.exec(err.detail);
+          if (unresolved) {
+            setNotice(
+              `The domain ${unresolved[1]} does not resolve, so there is no page to fetch. ` +
+                `The backend at ${endpoint.url ?? settings.backendUrl} refused the target instead of ` +
+                "reporting it, which older builds do — update the backend to get a full report " +
+                "(URL, domain-registration and model evidence) for unregistered names.",
+            );
+            return;
+          }
           setError(
-            `Live scan failed (${liveDetail}). Demo Mode produced this DEMO DATA result from URL features only.`,
+            `The backend refused this target: ${err.detail} (HTTP ${err.status}). No report was produced — the request was stopped before any layer ran, and the built-in scanner is not used as a silent substitute because it cannot produce the ML pre-filter, LLM or visual evidence.`,
           );
-        } else {
-          setError(`Analysis failed. Backend: ${detail}. Live scan: ${liveDetail}`);
+          return;
         }
+        detail = err instanceof BackendUnavailableError ? err.detail : String(err);
+      }
+    }
+
+    // 2. Server-side live scan engine: real fetch, DNS, RDAP and DOM parsing.
+    try {
+      const raw = await scanLive({
+        data: {
+          url: target,
+          safeThreshold: settings.safeThreshold,
+          suspiciousThreshold: settings.suspiciousThreshold,
+        },
+      });
+      const live = JSON.parse(raw as unknown as string) as AnalysisResult;
+      saveDemoAnalysis(live);
+      setResult(live);
+      setNotice(
+        !serverSide
+          ? `LIVE SCAN (REDUCED LAYERS) — the backend at ${endpoint.url ?? settings.backendUrl} answered, but the streamed scan failed${detail ? ` (${detail})` : ""}, so this result came from the server engine instead. The ML pre-filter, LLM reasoning and screenshot/brand-clone layers were not applied to this score.`
+          : endpoint.engine === "hosted"
+            ? "HOSTED SCAN — no backend answered, so this deployment ran the scan on its own server: real HTTP fetch with redirect chain, DNS-over-HTTPS, RDAP domain age and DOM analysis. The CatBoost pre-filter, the local LLM verdict and the Playwright screenshot layer belong to the self-hosted backend only, so they are not part of this score. To include them, run the backend on a host this page can reach (see Settings)."
+            : `LIVE SCAN (REDUCED LAYERS) — no backend answered at ${endpoint.tried.map((t) => t.url).join(" or ") || settings.backendUrl}${detail ? ` (${detail})` : ""}, so this result came from the built-in scanner: real HTTP fetch, DNS, RDAP and DOM analysis. The ML pre-filter, LLM reasoning and screenshot/brand-clone layers all live in the backend, so none of them were applied to this score.`,
+      );
+    } catch (liveErr) {
+      const liveDetail = liveErr instanceof Error ? liveErr.message : String(liveErr);
+      if (settings.demoMode) {
+        const demo = analyzeDemo({ url: target });
+        saveDemoAnalysis(demo);
+        setResult(demo);
+        setError(
+          `Live scan failed (${liveDetail}). Demo Mode produced this DEMO DATA result from URL features only.`,
+        );
+      } else {
+        setError(`Analysis failed. Backend: ${detail}. Live scan: ${liveDetail}`);
       }
     } finally {
       setBusy(false);
@@ -223,6 +282,23 @@ function AnalyzePage() {
       setBusy(false);
     }
   }
+
+  // A scan requested by the extension (`/analysis?url=…`). It runs once per
+  // distinct target — remounting the page or editing the URL afterwards must
+  // not silently re-scan — and asks for the live path even if a demo sample
+  // happens to share the address.
+  const linkedRun = useRef<string | null>(null);
+  useEffect(() => {
+    if (!linkedUrl || linkedRun.current === linkedUrl) return;
+    linkedRun.current = linkedUrl;
+    setMode("url");
+    setActiveDemo(null);
+    setUrl(linkedUrl);
+    void run(linkedUrl, { live: true });
+    // `run` is re-created on every render by design (it closes over the current
+    // settings and probe result); the ref is what makes this fire exactly once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [linkedUrl]);
 
   const field =
     "w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring";

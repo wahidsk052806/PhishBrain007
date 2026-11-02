@@ -100,7 +100,10 @@ export type IncomingMessage =
   | { type: "EMAIL_SUMMARY"; tabId: number; url: string; email: EmailSummaryPayload }
   | { type: "OPEN_DASHBOARD"; url: string }
   | { type: "CLEAR_VISUAL_EVIDENCE" }
-  | { type: "VISUAL_EVIDENCE_STATS" };
+  | { type: "VISUAL_EVIDENCE_STATS" }
+  /** Delivery check for the opt-in SOC webhook (options page button). */
+  | { type: "TEST_ALERT" }
+  | { type: "LAST_ALERT" };
 
 export function parseIncomingMessage(raw: unknown): IncomingMessage | null {
   if (!raw || typeof raw !== "object") return null;
@@ -148,6 +151,12 @@ export function parseIncomingMessage(raw: unknown): IncomingMessage | null {
   }
   if (msg.type === "VISUAL_EVIDENCE_STATS") {
     return { type: "VISUAL_EVIDENCE_STATS" };
+  }
+  if (msg.type === "TEST_ALERT") {
+    return { type: "TEST_ALERT" };
+  }
+  if (msg.type === "LAST_ALERT") {
+    return { type: "LAST_ALERT" };
   }
   return null;
 }

@@ -1,0 +1,37 @@
+# Local-only artifacts. Without this file every `docker compose build` shipped
+# node_modules, the backend virtualenv, .git and .output to the daemon — over a
+# gigabyte of context for a change to two source files.
+.git
+.gitignore
+
+# Dependencies: both images install their own.
+node_modules
+**/node_modules
+backend/venv
+backend/.venv
+**/__pycache__
+**/.pytest_cache
+
+# Build output: rebuilt inside the image.
+.output
+dist
+extension/dist
+.build
+coverage
+*.tsbuildinfo
+
+# Local database / cache files and test leftovers.
+*.db
+*.sqlite
+*.sqlite3
+backend/test_phishbrain.db
+*.log
+.pytest_cache
+
+# Packaging archives (regenerate with the extension scripts).
+extension/*.zip
+
+# Reports and scratch directories kept in the checkout.
+.tmp-report
+report
+screenshots

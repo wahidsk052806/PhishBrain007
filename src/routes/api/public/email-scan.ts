@@ -15,16 +15,27 @@ import { z } from "zod";
  *
  * POST {"from": "...", "reply_to": "...", "display_name": "...",
  *       "subject": "...", "body": "...", "links": ["https://..."]}
+ *
+ * `links` also accepts the extension's `text|href` pair form, which is what
+ * makes a link whose visible text says one domain while pointing at another
+ * detectable. The href is what gets fetched.
+ *
+ * Every optional field is `nullish`, not merely `optional`: the extension's
+ * parser models “absent” as `null` (`ParsedEmail.replyTo` and friends), and
+ * rejecting that turned an ordinary Gmail reply with no Reply-To header into a
+ * 400 — the self-hosted backend accepts it, so the hosted path has to as well.
  */
 const bodySchema = z.object({
-  from: z.string().max(320).optional(),
-  reply_to: z.string().max(320).optional(),
-  display_name: z.string().max(320).optional(),
-  subject: z.string().max(1000).optional(),
-  body: z.string().max(50000).optional(),
-  links: z.array(z.string().max(2048)).max(50).optional(),
-  safeThreshold: z.number().min(0).max(100).optional(),
-  suspiciousThreshold: z.number().min(0).max(100).optional(),
+  from: z.string().max(320).nullish(),
+  reply_to: z.string().max(320).nullish(),
+  display_name: z.string().max(320).nullish(),
+  subject: z.string().max(1000).nullish(),
+  body: z.string().max(50000).nullish(),
+  links: z.array(z.string().max(2048)).max(50).nullish(),
+  has_attachments: z.boolean().nullish(),
+  has_quoted_content: z.boolean().nullish(),
+  safeThreshold: z.number().min(0).max(100).nullish(),
+  suspiciousThreshold: z.number().min(0).max(100).nullish(),
 });
 
 const cors = {
@@ -61,13 +72,18 @@ export const Route = createFileRoute("/api/public/email-scan")({
           ...(subject ? { subject } : {}),
           ...(body ? { body } : {}),
           links: links ?? [],
+          ...(parsed.has_attachments == null ? {} : { has_attachments: parsed.has_attachments }),
+          ...(parsed.has_quoted_content == null
+            ? {}
+            : { has_quoted_content: parsed.has_quoted_content }),
         };
 
         try {
           const { runLiveAnalysis } = await import("@/lib/phishbrain/live-analyze.server");
           const { analyzeDemo } = await import("@/lib/phishbrain/demo");
+          const { firstHttpHref } = await import("@/lib/phishbrain/normalize");
 
-          const firstLink = (links ?? []).find((l) => /^https?:\/\//i.test(l));
+          const firstLink = firstHttpHref(links ?? []);
           let result;
           if (firstLink) {
             result = await runLiveAnalysis(firstLink, thresholds, email);

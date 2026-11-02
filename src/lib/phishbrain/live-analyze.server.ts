@@ -39,6 +39,7 @@ export async function runLiveAnalysis(
               iframe_count: scan.page.iframe_count,
               external_script_domains: scan.page.external_script_domains,
               brand_mentions: scan.page.brand_mentions,
+              brands_claimed: scan.page.brands_claimed,
             },
           }
         : {}),
@@ -51,6 +52,14 @@ export async function runLiveAnalysis(
       networkEvidence: {
         final_url: scan.final_url,
         redirected: scan.redirect_chain > 0,
+        // The chain itself is reported, not just whether one happened: a target
+        // that redirects to a host that then refuses the connection is a
+        // finding, and it was previously invisible (and reported as
+        // `redirected: false`) because redirects were followed opaquely.
+        redirect_hops: scan.redirect_hops.map((hop) => `${hop.status} ${hop.from} → ${hop.to}`),
+        fetch_failure: scan.fetch_failure
+          ? `${scan.fetch_failure.url} — ${scan.fetch_failure.reason}`
+          : "none",
         http_status: scan.http_status,
         server_header: scan.server_header ?? "unavailable",
         content_type: scan.content_type ?? "unavailable",

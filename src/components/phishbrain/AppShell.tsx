@@ -14,7 +14,9 @@ import {
   WifiOff,
 } from "lucide-react";
 import type { ReactNode } from "react";
+import type { HealthStatus } from "@/lib/phishbrain/types";
 import { api } from "@/lib/phishbrain/api";
+import { useBackendEndpoint } from "@/lib/phishbrain/useBackendEndpoint";
 import { usePhishbrainSettings } from "@/lib/phishbrain/usePhishbrainSettings";
 import { cn } from "@/lib/utils";
 
@@ -27,16 +29,85 @@ const NAV = [
   { to: "/about", label: "About", icon: Info },
 ] as const;
 
+/**
+ * Which subsystems the health payload reports as down.
+ *
+ * `status: "degraded"` on its own was a dead end: the badge said the backend
+ * was degraded and nothing on the page said why. The API already names each
+ * dependency, so the badge names the broken ones too.
+ */
+function degradedSubsystems(health: HealthStatus): { label: string; detail: string }[] {
+  const down: { label: string; detail: string }[] = [];
+  if (health.database !== "ok") {
+    down.push({
+      label: "database",
+      detail: `The ${health.database_backend ?? "configured"} database cannot be reached: analyses are still scored, but they are not saved, so History and Alerts stay empty.`,
+    });
+  }
+  if (health.cache !== "ok") {
+    down.push({
+      label: "cache",
+      detail: `The ${health.cache_backend ?? "configured"} cache did not answer, so every scan re-runs the whole pipeline.`,
+    });
+  }
+  if (health.ollama !== "ok") {
+    down.push({
+      label: "local LLM",
+      detail:
+        health.ollama === "unknown"
+          ? "The Ollama reachability check did not run."
+          : "Ollama is unreachable, so scans fall back to the deterministic assessment.",
+    });
+  }
+  return down;
+}
+
 function BackendStatus() {
   const { settings } = usePhishbrainSettings();
+  // Which engine serves this browser is resolved by probing, not assumed from
+  // the page origin: a dashboard opened over the LAN now finds the backend on
+  // the machine serving the page and reports it as online, instead of calling
+  // the visitor's own `localhost` and labelling the whole deployment "hosted".
+  const { resolution, isLoading: resolving } = useBackendEndpoint();
+  const engine = resolution?.engine;
+  const backendUrl = resolution?.url ?? settings.backendUrl;
   const { data, isError, isLoading } = useQuery({
-    queryKey: ["health", settings.backendUrl],
+    queryKey: ["health", backendUrl],
     queryFn: () => api.health(),
     retry: false,
+    enabled: engine === "backend",
     refetchInterval: 30_000,
   });
 
   const online = !!data && !isError;
+  const degraded = data ? degradedSubsystems(data) : [];
+
+  if (!engine || resolving) {
+    return (
+      <div
+        className="flex items-center gap-2 rounded-md border border-border bg-muted px-2.5 py-1 text-xs font-medium text-muted-foreground"
+        title={`Probing ${resolution?.tried.map((t) => t.url).join(", ") || settings.backendUrl} for a PhishBrain backend.`}
+      >
+        <Activity aria-hidden="true" className="size-3.5" />
+        <span className="font-mono">checking backend…</span>
+      </div>
+    );
+  }
+
+  if (engine !== "backend") {
+    return (
+      <div
+        className="flex items-center gap-2 rounded-md border border-safe/40 bg-safe-soft px-2.5 py-1 text-xs font-medium text-safe"
+        title={`No backend answered at ${resolution?.tried.map((t) => t.url).join(" or ")}. ${engine === "hosted" ? "This deployment scans with its own server engine (HTTP fetch, DNS-over-HTTPS, RDAP, DOM analysis)." : "Scans use the built-in browser scanner."}`}
+      >
+        <Activity aria-hidden="true" className="size-3.5" />
+        <span className="font-mono">
+          {engine === "hosted" ? "hosted engine" : "built-in scanner"}
+        </span>
+      </div>
+    );
+  }
+
   return (
     <div
       className={cn(
@@ -46,7 +117,13 @@ function BackendStatus() {
           : "border-border bg-muted text-muted-foreground",
       )}
       title={
-        online ? "PhishBrain backend reachable" : `Backend not reachable at ${settings.backendUrl}`
+        !online
+          ? `Backend stopped answering at ${backendUrl}`
+          : degraded.length
+            ? `PhishBrain backend reachable at ${backendUrl}, but degraded:\n${degraded
+                .map((d) => `• ${d.label}: ${d.detail}`)
+                .join("\n")}`
+            : `PhishBrain backend reachable at ${backendUrl} — CatBoost pre-filter, local LLM verdict and screenshot layer active.`
       }
     >
       {online ? (
@@ -55,7 +132,13 @@ function BackendStatus() {
         <WifiOff aria-hidden="true" className="size-3.5" />
       )}
       <span className="font-mono">
-        {isLoading ? "checking backend…" : online ? `backend ${data.status}` : "backend offline"}
+        {isLoading
+          ? "checking backend…"
+          : !online
+            ? "backend offline"
+            : degraded.length
+              ? `backend degraded · ${degraded.map((d) => d.label).join(", ")}`
+              : "backend ok"}
       </span>
     </div>
   );

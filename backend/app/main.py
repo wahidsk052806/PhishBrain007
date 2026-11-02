@@ -20,9 +20,6 @@ from app.ml.prefilter import get_prefilter
 configure_logging()
 logger = get_logger(__name__)
 
-CORS_ORIGIN_REGEX = r"^(chrome-extension://.*|http://localhost(:\d+)?|http://127\.0\.0\.1(:\d+)?)$"
-
-
 class MaxBodySizeMiddleware(BaseHTTPMiddleware):
     """Rejects requests whose declared Content-Length exceeds the configured cap."""
 
@@ -121,7 +118,9 @@ def create_app() -> FastAPI:
     app.add_middleware(MaxBodySizeMiddleware)
     app.add_middleware(
         CORSMiddleware,
-        allow_origin_regex=CORS_ORIGIN_REGEX,
+        # Configurable so a LAN-served dashboard can reach the API; see
+        # CORS_ORIGIN_REGEX in app/core/config.py for what is allowed and why.
+        allow_origin_regex=settings.CORS_ORIGIN_REGEX,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

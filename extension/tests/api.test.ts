@@ -139,7 +139,84 @@ describe("backend result normalization", () => {
     expect(again.url).toBe(normalized.url);
   });
 
+  it("surfaces the backend's screenshot comparison as `visual`", () => {
+    // Regression: the popup reads `result.visual`, but only the webpage
+    // layer's details carried the comparison. Every server result therefore
+    // said "visual analysis unavailable" even when a screenshot had been
+    // captured and scored.
+    const withVisual = {
+      ...serverPayload,
+      layer_evidence: [
+        {
+          layer: "webpage",
+          risk_score: 12,
+          indicators: [],
+          details: {
+            has_password_field: false,
+            visual_similarity_score: 0.81,
+            possible_brand: "netflix",
+            visual_indicators: ["Screenshot compared against 43 reference images"],
+            screenshot_data_url: "data:image/png;base64,AAAA",
+          },
+        },
+      ],
+    };
+
+    const visual = normalizeServerResult(withVisual).visual;
+
+    expect(visual?.status).toBe("ok");
+    expect(visual?.visual_similarity_score).toBe(0.81);
+    expect(visual?.possible_brand).toBe("netflix");
+    expect(visual?.screenshot_thumbnail).toBe("data:image/png;base64,AAAA");
+    expect(visual?.visual_indicators).toEqual([
+      "Screenshot compared against 43 reference images",
+    ]);
+  });
+
+  it("does not invent a visual verdict when the scan had none", () => {
+    expect(normalizeServerResult(serverPayload).visual).toBeUndefined();
+  });
+
   it("points 'Open dashboard' at the dashboard port, not the API port", () => {
     expect(DEFAULT_DASHBOARD_URL).toBe("http://127.0.0.1:8080");
+  });
+});
+
+describe("scan request body", () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("forwards use_llm and fetch_page so a fast pass can skip the slow layers", async () => {
+    let sent: Record<string, unknown> | null = null;
+    global.fetch = vi.fn(async (_url: string, init: RequestInit) => {
+      sent = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({
+          analysis_id: "x",
+          target: "https://example.com",
+          threat_score: 1,
+          risk_level: "SAFE",
+          confidence: 0.5,
+          indicators: [],
+          explanation: "",
+          recommended_action: "",
+          latency_ms: 1,
+          degraded: [],
+          layer_evidence: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+
+    await analyzeUrl(
+      { url: "https://example.com", use_llm: false, fetch_page: false },
+      "http://127.0.0.1:9999",
+    );
+
+    expect(sent).toMatchObject({ use_llm: false, fetch_page: false });
   });
 });

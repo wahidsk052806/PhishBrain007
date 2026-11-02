@@ -1,533 +1,512 @@
 # PhishBrain 🧠
 
-PhishBrain is an advanced, privacy-first phishing detection system that uses a multi-layered approach to analyze suspicious content. It combines traditional heuristics, machine learning (CatBoost), and local Large Language Models (LLMs) to provide transparent and explainable risk assessments.
+Privacy-first, explainable phishing detection for web pages, URLs and email. Four deterministic
+layers (URL, domain, page, email) are combined with a **CatBoost pre-filter**, a **local LLM
+verdict** and a **rendered-screenshot brand-clone comparison** into one 0–100 threat score that
+carries its own evidence.
+
+Nothing leaves your infrastructure: no Google Safe Browsing, no OpenAI, no third-party API.
+
+---
+
+## Contents
+
+- [Architecture](#architecture)
+- [Features](#features)
+- [Quickstart](#quickstart)
+- [API](#api)
+- [How a score is produced](#how-a-score-is-produced)
+- [ML pipeline (CatBoost pre-filter)](#ml-pipeline-catboost-pre-filter)
+- [Browser extension](#browser-extension)
+- [Firefox: temporary and permanent install](#firefox-temporary-and-permanent-install)
+- [Deployment](#deployment)
+- [Verify it yourself](#verify-it-yourself)
+- [Troubleshooting](#troubleshooting)
+- [Documentation map](#documentation-map)
+
+---
 
 ## Architecture
 
 ```text
-                                  +-------------------+
-                                  | Browser Extension |
-                                  +---------+---------+
-                                            |
-                                            v
-    +---------------------------------------+---------------------------------------+
-    |                                FastAPI Backend                                |
-    |  +-------------------+        +-------------------+        +-------------------+ |
-    |  |   ML Prefilter    | <----> |  Analysis Engine  | <----> |   LLM Analyzer    | |
-    |  |    (CatBoost)     |        |   (Scoring Logic) |        |     (Ollama)      | |
-    +----------+-----------+        +---------+---------+        +---------+---------+
-               |                              |                           |
-               v                              v                           v
-    +-------------------+        +-------------------+        +-------------------+
-    |      Valkey       |        |    PostgreSQL     |        |      Ollama       |
-    |      (Cache)      |        |    (History)      |        |     (Llama 3.1)   |
-    +-------------------+        +-------------------+        +-------------------+
+                      +------------------------------+
+                      |  Browser extension (MV3)     |
+                      |  popup · banner · mail card  |
+                      +--------------+---------------+
+                                     |  HTTPS / JSON
+                     +---------------+----------------+
+                     |                                |
+                     v                                v
+      +------------------------------+   +------------------------------+
+      |  FastAPI backend  :8000      |   |  Dashboard (TanStack Start)  |
+      |                              |   |  :8080 / Workers             |
+      |  CAPTURE → PARSE →           |   |  /analysis /history          |
+      |  PRE-FILTER → LAYERS →       |   |  /alerts  /settings          |
+      |  LLM → SCORE                 |   |                              |
+      |                              |   |  /api/public/* reduced scan  |
+      |  CatBoost · Ollama ·         |   |  (real fetch, DNS, RDAP, DOM)|
+      |  Playwright (screenshots)    |   +--------------+---------------+
+      +----+----------+----------+---+                  |
+           |          |          |                      |
+           v          v          v                      |
+     +-----------+ +--------+ +--------+                |
+     | PostgreSQL| | Valkey | | Ollama |                |
+     | (history) | | (cache)| | (LLM)  |                |
+     +-----------+ +--------+ +--------+                |
+                                                        |
+                     served by the same deployment ------+
 ```
+
+Three ways to run it, and all three are supported:
+
+| Shape | What runs where | Full pipeline? |
+| --- | --- | --- |
+| **Docker Compose** on one box | dashboard + backend + Postgres + Valkey + Ollama | ✅ everything |
+| **Dashboard on Cloudflare Workers**, backend on any Linux VM behind a tunnel | static/SSR dashboard, full backend at `api.<your-domain>` | ✅ everything (recommended for a public site) |
+| **Dashboard alone** | Workers/Nitro only | ❌ reduced: real fetch, DNS-over-HTTPS, RDAP, DOM — no CatBoost, no LLM, no Playwright |
+
+Runner-up detail for all three: [`deploy/README.md`](deploy/README.md).
 
 ## Features
 
-- **Multi-Layer Analysis**: Evaluates emails, URLs, domain reputation, and visual webpage features.
-- **Explainable AI**: Provides detailed reasoning for every risk score, not just a binary result.
-- **Privacy-First**: Designed to run entirely locally. No data is sent to third-party APIs.
-- **Hybrid Scoring**: Combines fast CatBoost pre-filtering with deep LLM reasoning.
-- **Real-time Extension**: Instant analysis of the current browsing context.
+- **Four evidence layers** — URL structure, domain registration/DNS/TLS, rendered page (forms,
+  credential fields, brand mismatch, favicon), and email (sender/Reply-To mismatch, lookalike
+  domains, display-name spoofing, link text vs destination, and the destination itself scored by the
+  URL/domain layers).
+- **CatBoost pre-filter** — a trained lexical model contributing a disclosed 15% of the base score.
+- **Local LLM verdict** — `llama3.2:3b` through Ollama on CPU; structured JSON, never raw
+  chain-of-thought, with a labelled deterministic fallback when the model is unavailable.
+- **Screenshot / brand-clone evidence** — Playwright renders the page, a perceptual hash is compared
+  against a local reference set, and the captured thumbnail travels with the report.
+- **Explainable everywhere** — every layer ships its raw evidence; every result is exportable as
+  JSON/CSV and as a SOC event.
+- **Progressive results** — the deterministic verdict is on screen in ~5 s; the LLM verdict replaces
+  it in place when it lands.
+- **Extension that needs no setup** — a production build ships the deployed API/dashboard origins,
+  so an install on a stranger's device scans immediately.
 
 ### How the layers decide
 
 Only claims score, not coincidences. A page with a credential form is flagged as brand
-impersonation when it _presents itself_ as a brand — the brand name in its title or a heading —
-and is served from a domain that is not that brand's. A page that merely links to other
-companies is not: `github.com/login` was previously scored 48/100 SUSPICIOUS purely for
-mentioning "google", "microsoft" and "amazon" in its SSO buttons and footer. Body mentions are
-still recorded in the evidence, and the LLM's page digest separates `brands_claimed` from
-`brand_mentions_in_body`, so the model is not invited to make the same mistake.
+impersonation when it *presents itself* as a brand — in its title or a heading — **and** is served
+from a domain that is not that brand's. A page that merely links to other companies is not:
+`github.com/login` used to score 48/100 SUSPICIOUS purely for mentioning "google", "microsoft" and
+"amazon" in SSO buttons. Body mentions stay in the evidence, and the LLM digest separates
+`brands_claimed` from `brand_mentions_in_body` so the model is not invited to repeat the mistake.
+
+The same rule is implemented in both engines, so `netflix.com` reports **SAFE, single digits** in
+the backend *and* in the built-in scanner (it previously matched "apple" inside an
+`apple-touch-icon` `<link>` tag and lost 20 points for markup).
+
+Email links are judged the same way — on claims, not coincidences. The visible label only counts as
+a destination claim when it *names a host* (`www.paypal.com`), never when it is prose (`Join
+Superset`, `View in browser`); otherwise every newsletter produced a "text/href mismatch" and
+unrelated messages all settled on the same 20/100. On top of that, the riskiest link in the message
+is scored as a destination by the URL and domain layers, so an innocuous message with one link to a
+fresh typosquat is now HIGH_RISK instead of SAFE. The link is scored from strings and never opened —
+reading it server-side would tell the sender the message was read, so the destination's own content
+is disclosed as not examined rather than guessed at. Link evidence is *corroborative*: it can raise
+an email's verdict, and a clean link can never lower it.
 
 ## Quickstart
 
-### Using Docker (Recommended)
-
-1. Clone the repository.
-2. Ensure you have Docker and Docker Compose installed.
-3. Run:
-   ```bash
-   docker compose up -d
-   ```
-4. The frontend will be available at `http://localhost:8080` and the backend API at `http://localhost:8000`.
-
-_Note: The first run will pull the Llama 3.1 model (approx. 4.7GB) via Ollama, which may take some time depending on your connection._
-
-### Local Development
-
-**Backend:**
-
-```bash
-cd backend
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload
-```
-
-**Frontend:**
-
-```bash
-bun install
-bun dev          # dashboard at http://localhost:8080
-```
-
-**Run the built site (production server):**
-
-```bash
-bun run build
-PORT=8080 bun .output/server/index.mjs   # same entry point the Docker image uses
-```
-
-`vite preview` does **not** serve this app: the build targets Nitro's `cloudflare-module` preset,
-so the only entry points are `.output/server/index.mjs` (bun/node, used by `docker/Dockerfile.frontend`)
-or `npx wrangler --cwd .output dev` for a Cloudflare deploy.
-
-### What happens to what you type
-
-- `hianime.to`, `example.com/login`, `//example.com`, `https:/example.com` — all normalised to an
-  absolute URL (`https://…)` before the SSRF guard runs, by both the dashboard and the backend
-  (`normalize_url_input` in `backend/app/core/security.py`). A bare hostname is the most natural
-  way to name a site and is not a security decision, so it is no longer refused with
-  "Scheme '' is not allowed". `javascript:`, `data:` and `file:` are still rejected, by name.
-- If the host does not answer, the report says so in words — "the connection attempt timed out —
-  the host is unreachable from this network" — instead of a bare `webpage.fetch_failed` code, and
-  the screenshot/brand-clone phase is skipped, because there is no rendered page to compare. The
-  URL, domain, ML pre-filter and LLM layers still run and are still reported.
-- Unreachable hosts fail fast: the page fetch caps the TCP connect attempt at 8 s instead of
-  letting the whole per-layer budget expire.
-
-## API Reference
-
-| Endpoint                     | Method | Description                                                 |
-| ---------------------------- | ------ | ----------------------------------------------------------- |
-| `/api/v1/analyze`            | POST   | Submits content (URL/Email) for full multi-layer analysis.  |
-| `/api/v1/analyze/url/stream` | POST   | Same scan, streamed as Server-Sent Events (see below).      |
-| `/api/v1/history`            | GET    | Retrieves a paginated list of previous analysis results.    |
-| `/api/v1/health`             | GET    | Returns the system status and connectivity to sub-services. |
-
-### Progressive results (why a scan no longer feels like a 60 s hang)
-
-The local LLM is 80-90% of a full scan, so waiting for one response meant staring at nothing
-for a minute while information that already existed at 5 s sat unsent. `POST
-/api/v1/analyze/url/stream` reports each stage as it completes instead:
-
-| Event            | When                    | Payload                                                                 |
-| ---------------- | ----------------------- | ----------------------------------------------------------------------- |
-| `started`        | immediately             | the normalised target                                                   |
-| `layer`/`layers` | as each layer finishes  | `url`, then `domain` + `webpage` evidence                               |
-| `prefilter`      | after the ML pre-filter | score, method, calibration                                              |
-| `provisional`    | before the LLM runs     | a **labelled** score over the deterministic layers only                 |
-| `llm`            | when the verdict lands  | the LLM assessment (and the webpage layer, now carrying the screenshot) |
-| `final`          | at the end              | the same payload as the non-streaming endpoint                          |
-
-Measured on the reference box for an uncached `example.com` scan: `started` at 2 s, first
-layer at 3 s, **provisional score at 5 s**, LLM verdict at 47 s. The dashboard renders the
-provisional report immediately (banner: "PROVISIONAL — ... the on-device LLM reasoning step
-is still running") and replaces it in place when the verdict arrives. A refused target is
-still a plain 4xx with the same body as the non-streaming endpoint, so a refusal is never
-mistaken for a stalled stream.
-
-A streaming _cache hit_ resolves immediately and skips the intermediate events, since the
-finished result already exists.
-
-### Scan latency, and how to make it faster
-
-Measured on a 4-core CPU-only box, page fetch on, over repeated scans:
-
-| Mode                   | Request                       | Mean                  | Breakdown                                                                         |
-| ---------------------- | ----------------------------- | --------------------- | --------------------------------------------------------------------------------- |
-| Fast                   | `{"use_llm": false}`          | **8.3 s** (7.6-8.7 s) | fetch ~1.9 s, layers ~0.9 s, screenshot ~5.4 s                                    |
-| Full                   | `{"use_llm": true}` (default) | **~55-62 s**          | the above plus 32-48 s of local `llama3.2` inference                              |
-| Full, unreachable host | any                           | ~58 s                 | connect 8.8 s, domain 10.7 s (overlapped with the fetch), no screenshot, LLM 38 s |
-
-Every response carries `timings` (per phase) and `latency_ms`, so "it is slow" is answerable
-without profiling. The local LLM is 80-90% of a full scan and runs on the CPU: `llama3.2`
-measured 5.3-5.9 tokens/s generation and ~39 tokens/s prefill here, so a 600-token prompt plus
-an 80-token answer is ~30 s of the scan on its own. `use_llm: false` is the supported fast path
-for bulk work and pre-filter-only triage. The backend warms the model in the background at
-startup (`LLM_WARMUP_ON_STARTUP`), which removes the ~15-30 s first-scan penalty after a
-restart; `LLM_KEEP_ALIVE` keeps it resident between scans. For interactive use the dashboard
-streams the scan instead (see _Progressive results_ above), so the deterministic verdict is
-on screen in ~5 s even when the LLM needs a further 45 s.
-
-What made the difference (each was a measured fix, not a guess):
-
-| Fix                                                                                | Effect                                                                                                                |
-| ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| Domain lookups (RDAP/DNS/TLS) start _before_ the page fetch is awaited             | removes min(fetch, domain) ≈ 1-9 s from every scan                                                                    |
-| No screenshot when the page fetch failed                                           | removes ~26 s of CPU and a misleading "visual: unavailable"                                                           |
-| 8 s connect cap on the fetch                                                       | an unreachable host fails in 8 s instead of 21 s                                                                      |
-| Accept the model's own vocabulary (`"Phishing"`, `80` for 0.8) instead of retrying | removes a second ~30 s inference on most scans, and stops discarding a real model verdict for the rules-only fallback |
-
-## ML Pipeline
-
-The CatBoost prefilter is trained offline and loaded by the backend at startup from
-`backend/models/prefilter.cbm`. No model is bundled with this repo: until you train one,
-every analysis reports `ml.deterministic_fallback` and the prefilter is deliberately left
-out of the threat score.
-
-1. **Download Data**: `python scripts/data/download_data.py --confirm` (opt-in public feeds)
-2. **Collect benign deep URLs**: `python scripts/data/fetch_benign_urls.py --confirm`
-   Adds real, path-bearing benign URLs from the Internet Archive. Skipping this step lets
-   the model learn “URL has a path ⇒ phishing” and flag ordinary pages.
-3. **Prepare Dataset**: `python scripts/data/prepare_dataset.py`
-4. **Train Prefilter**: `python ml/training/train_prefilter.py`
-   Training is **gated**: the candidate is scored on a leakage-free, time-ordered split and
-   only written to `backend/models/prefilter.cbm` if it clears the bar in
-   `ml/evaluation/gate.py`. A rejected run leaves the previously deployed model untouched and
-   writes the reasons to `ml/evaluation/reports/train_gate.md`.
-5. **Evaluate**: `python ml/evaluation/report.py`
-   Writes `ml/evaluation/reports/latest.{json,md}` including both tier verdicts.
-
-### Which gate tier the model passed — and what that means
-
-There are two bars, named rather than silently tuned (`ml/evaluation/gate.py`):
-
-| Tier     | What it certifies                                          | Used for                                                              |
-| -------- | ---------------------------------------------------------- | --------------------------------------------------------------------- |
-| `strict` | Precision-grade: fit to decide alone                       | Short-circuiting the pipeline without the later layers                |
-| `triage` | Fit to be one disclosed signal among several (the default) | The 15%-weighted prefilter, whose verdict every other layer re-checks |
-
-A purely lexical model does not reach `strict` on the public feeds — measured on the honest
-split, the lowest threshold satisfying the false-positive ceiling reaches ~0.79 recall — so
-holding deployment to that bar only ever produces an unvalidated leftover artifact and a
-permanently red CI job. The default `triage` bar is enforced instead, and **every** report
-carries both verdicts. Promote a model with `--gate-tier strict` when it is genuinely ready.
-
-The gate also reports the false-positive rate against a ceiling widened by 1.96 standard
-errors of the _measured_ benign sample (110 rows today, so ±5.6pp). That tolerance is printed
-next to the threshold and shrinks by itself as benign data grows, so a candidate is never
-rejected over a difference smaller than the measurement's own noise.
-
-### The deployed model says what it is
-
-`backend/models/prefilter.cbm.meta.json` and every analysis response carry the model's
-provenance, so a score can be audited without training anything:
-
-- `gate.tier`, `gate.passed`, `gate.strict_passed` — which bar it cleared (and which it did not)
-- `split`/`split_mode`/`zero_day` — the split its metrics were measured on
-- `metrics` — the honest held-out numbers, plus `decision_threshold` and the calibration used
-- per-scan `prefilter.gate_tier`, `gate_passed`, `prefilter.decision_threshold`,
-  `score_above_threshold`, `split`, `trained_at`
-
-Two optional switches exist for the probability score and the operating point
-(`--calibrate`, `--select-threshold`) and are **off by default**: with today's class mix every
-available held-out slice is phishing-heavy, so a fitted map is driven by that mix rather than
-by production traffic (a random slice measured worse: FPR@0.5 0.11 → 0.31; the time-tail slice
-was degenerate because recent benign data is absent). They become the right fix once benign
-coverage of the observation window improves.
-
-See `ml/README.md` for the feature contract and a full explanation of the gate.
-
-## Browser Extension Installation
-
-```bash
-cd extension
-bun install
-bun run build          # writes extension/dist (Chrome/Edge manifest)
-bun run test           # 70 unit tests (includes the popup report)
-```
-
-**Chrome / Edge / Brave**
-
-1. Go to `chrome://extensions/`.
-2. Enable **Developer mode** (top right).
-3. Click **Load unpacked** and select `extension/dist`.
-
-**Mozilla Firefox**
-
-The Firefox package is a separate build artefact because the manifest differs (MV3 with
-`background.scripts` instead of a service worker):
-
-```bash
-cd extension
-bun run build && bun run zip:firefox   # -> extension/phishbrain-extension-firefox.zip
-```
-
-1. Open **`about:debugging#/runtime/this-firefox`**.
-2. Click **Load Temporary Add-on…** and pick either
-   `extension/phishbrain-extension-firefox.zip` (Firefox accepts a packaged `.zip`/`.xpi`) or the
-   unzipped folder's `manifest.json`. Trust it when asked.
-3. The add-on appears as **PhishBrain007**; pin it from the toolbar's extensions menu.
-   Temporary add-ons are removed when Firefox closes — for a permanent install, submit the same
-   zip to https://addons.mozilla.org/developers/ (free) or self-sign it:
-   `npx web-ext sign --source-dir extension/dist --artifacts-dir . --api-key … --api-secret …`.
-
-The package is validated with Mozilla's own linter (`npx web-ext lint --source-dir dist
---self-hosted`): **0 errors, 0 notices**. The remaining warnings are seven
-`UNSAFE_VAR_ASSIGNMENT` notices from inside the bundled React DOM (this project's own source
-contains no `innerHTML`) and one Android-only minimum-version note. The manifest declares its
-data collection (`browsingActivity`, `websiteContent`), which Firefox 140+ requires for new
-submissions.
-
-Set the backend URL in the extension Options page (default `http://127.0.0.1:8000`). With the
-**“Fall back to hosted live scans”** toggle on (default) and no local backend, the extension uses
-your hosted `…/api/public/scan` and `…/api/public/email-scan` endpoints automatically.
-
-### What the toolbar popup shows
-
-The popup is a full, explainable report — not just a badge. For the current tab it renders the
-verdict (risk level, `n/100` threat score, confidence, latency, analysis ID), the deduplicated
-**“Why this verdict”** indicators, the complete assessment text, a **layer-by-layer breakdown**
-(URL structure, Domain & DNS, Page content, Email context) with each layer's risk and raw
-evidence, the **ML pre-filter** card (whether CatBoost was consulted, its score, weight, gate
-tier and decision threshold), the **local LLM** assessment (model, classification,
-confidence, reasoning summary), the **visual / brand-clone** result (with the captured screenshot
-and the matched brand's reference side by side, plus the edge-map overlay, per-region similarity
-heatmap and comparison score), the recommended action, and any degraded layers. Demo results are
-clearly labelled `DEMO DATA`.
-
-### Alerts
-
-Three signals fire on a detection, all configurable from the Options page:
-
-- **Toolbar badge** — `OK` / `!` / `!!` with a colour and a hover title carrying the score.
-- **In-page warning banner** on `SUSPICIOUS`/`HIGH_RISK` pages above your threshold, with
-  _View Detailed Analysis_, _Go Back_ and _Proceed Anyway_ (which adds the host to your allowlist).
-- **Desktop notification** on `HIGH_RISK`, so a hit reaches you even while you are on another tab
-  (disabled by setting banner mode to _silent_; requires the `notifications` permission declared
-  in both manifests).
-
-Set `alertWebhookUrl` to also POST every high-risk detection to a SOC/SIEM or email relay.
-
-## Deploying with 100% open-source infrastructure
-
-Everything PhishBrain needs is FOSS: Docker/Podman, PostgreSQL, Valkey, Ollama, FastAPI, Bun. No SaaS accounts, no paid APIs.
-
-### 1. Single host (recommended)
-
-Any Linux box or VPS (Hetzner, OVH, or your own hardware) with 4 CPU / 8 GB RAM (16 GB if you run Llama 3.1 8B comfortably):
+### Docker (recommended)
 
 ```bash
 git clone <your-repo> phishbrain && cd phishbrain
-cp .env.example .env          # edit secrets, weights, thresholds
-docker compose up -d --build  # or: podman-compose up -d --build
+cp .env.example .env               # set POSTGRES_PASSWORD and anything you want to tune
+docker compose up -d --build
 docker compose logs -f backend
 ```
 
-Services: `frontend` :8080, `backend` :8000, `postgres`, `valkey`, `ollama` (pulls Llama 3.1 on first boot, ~4.7 GB).
+Dashboard <http://localhost:8080> · API <http://localhost:8000/api/v1/health>.
+First boot pulls `llama3.2:3b` (~2 GB) — that pull and the backend read the **same**
+`OLLAMA_MODEL`, so they cannot disagree.
 
-### 2. Put it behind a free TLS reverse proxy
-
-Caddy (open source, automatic Let's Encrypt certs) — add a `Caddyfile`:
-
-```text
-phishbrain.example.com {
-    handle /api/* { reverse_proxy backend:8000 }
-    handle        { reverse_proxy frontend:8080 }
-}
-```
-
-and a service in `docker-compose.yml`:
-
-```yaml
-caddy:
-  image: caddy:2-alpine
-  ports: ["80:80", "443:443"]
-  volumes:
-    - ./Caddyfile:/etc/caddy/Caddyfile
-    - caddy_data:/data
-  depends_on: [backend, frontend]
-```
-
-Nginx + Certbot works equally well if you prefer it.
-
-### 3. Kubernetes (K3s) for multi-node
-
-- Install [K3s](https://k3s.io) (Apache-2.0) on your nodes.
-- Convert the compose file with `kompose convert`, or write plain manifests.
-- Run Postgres via the CloudNativePG operator, Valkey as a StatefulSet, Ollama as a Deployment with a GPU node selector and a PVC for models.
-- Expose with Traefik (bundled with K3s) + cert-manager for TLS.
-
-### 4. GPU acceleration (optional)
-
-Install the NVIDIA container toolkit and add to the `ollama` service:
-
-```yaml
-deploy:
-  resources:
-    reservations:
-      devices:
-        - { driver: nvidia, count: 1, capabilities: [gpu] }
-```
-
-Swap `OLLAMA_MODEL` to `llama3.1:8b-instruct-q4_K_M` on smaller machines, or `mistral` / `qwen2.5` — all open weights.
-
-### 5. Hardening checklist
-
-- Change `POSTGRES_PASSWORD`, keep Postgres/Valkey off public ports (no `ports:` mapping).
-- Keep `STORE_RAW_EMAIL=false` and short `RETENTION_DAYS` / `VISUAL_RETENTION_DAYS` for privacy
-  compliance; set `VISUAL_RETENTION_DAYS=0` (or `VISUAL_SCREENSHOT_MODE=off`) to store no screenshots
-  at all.
-- Restrict CORS to your dashboard origin and your extension ID.
-- Back up with `pg_dump` on a cron; snapshot the `ollama_data` volume to avoid re-pulling models.
-- Optional observability: Prometheus + Grafana + Loki, all open source.
-
-### 6. Dashboard-only deploy
-
-The dashboard is a TanStack Start app and can run anywhere Node/Bun runs.
-
-The default build target is a **Cloudflare Worker** (a `fetch` handler), which does _not_ serve
-under `bun .output/server/index.mjs` — it exits immediately. Build with the Node server preset:
+### Local development
 
 ```bash
-bun install
-NITRO_PRESET=node-server bun run build      # writes .output/server/index.mjs (a real HTTP server)
+# backend (Python 3.12 — 3.13 has no wheels for CatBoost / y-py)
+cd backend
+python -m venv venv
+venv/Scripts/python.exe -m pip install -r requirements.txt        # Windows
+# source venv/bin/activate && pip install -r requirements.txt     # macOS / Linux
+venv/Scripts/python.exe -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+
+# dashboard + extension (in another terminal, from the repo root)
+bun install && bun dev            # http://localhost:8080
+
+# extension
+cd extension && npm ci && npm run build      # dist/ (Chrome/Edge)
+```
+
+Ollama is optional: without it every scan reports `llm.deterministic_fallback` and the deterministic
+verdict stands. To include the model, run `ollama serve` and `ollama pull llama3.2:3b`.
+
+### Running it in VS Code
+
+Open the folder that contains `backend/`, then use **three terminals** (the full command-by-command
+version, including the PowerShell/shell variants and every error message with its fix, is in
+[`deploy/README.md`](deploy/README.md) and [`workingexplaination.txt`](workingexplaination.txt)):
+
+| Terminal | Command | Serves |
+| --- | --- | --- |
+| 1 | `ollama serve` (once) | model server on `:11434` |
+| 2 | `cd backend && venv/Scripts/python.exe -m uvicorn app.main:app --reload --port 8000` | API on `:8000` |
+| 3 | `bun dev` | dashboard on `:8080` |
+
+### What happens to what you type
+
+`hianime.to`, `example.com/login`, `//example.com`, `https:/example.com` are all normalised to an
+absolute URL before the SSRF guard runs, in both the dashboard and the backend. A bare hostname is
+how people name a site, not a security decision. `javascript:`, `data:` and `file:` are still
+refused by name.
+
+An unreachable host fails **fast** (8 s connect cap), is reported as a report — not a 5xx — and
+skips the screenshot phase, because there is no rendered page to compare. The URL, domain,
+pre-filter and LLM layers still run and are still reported.
+
+## API
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/v1/analyze/url` | POST | Full URL/page analysis |
+| `/api/v1/analyze/url/stream` | POST | Same scan, streamed as Server-Sent Events |
+| `/api/v1/analyze/page` | POST | Analysis with a client-side DOM summary |
+| `/api/v1/analyze/email` | POST | Email-layer analysis |
+| `/api/v1/analysis/{id}` | GET | One stored report |
+| `/api/v1/history` | GET | Paginated history |
+| `/api/v1/alerts` | GET | Detections at/above the threshold |
+| `/api/v1/feedback` | POST | Analyst verdict on an analysis |
+| `/api/v1/export/{id}` | GET | JSON/CSV export |
+| `/api/v1/health` | GET | Status of database, cache and Ollama |
+| `/api/v1/config` | GET | Weights, thresholds, model name, brands |
+
+`POST /api/v1/analyze/url` body:
+
+```json
+{ "url": "https://example.com/login", "fetch_page": true, "use_llm": true }
+```
+
+`use_llm: false` is the supported fast path (~8 s instead of ~55–60 s) for bulk work and
+pre-filter-only triage.
+
+### Progressive results
+
+| Event | When | Payload |
+| --- | --- | --- |
+| `started` | immediately | normalised target |
+| `layer`/`layers` | per layer | URL, then domain + webpage evidence |
+| `prefilter` | after the pre-filter | score, method, calibration |
+| `provisional` | before the LLM | a **labelled** score over deterministic layers |
+| `llm` | verdict ready | LLM assessment + webpage layer (now carrying the screenshot) |
+| `final` | end | identical to the non-streaming response |
+
+Measured on a 4-core CPU box for an uncached `example.com`: `started` 2 s, first layer 3 s,
+**provisional score 5 s**, LLM verdict 47 s. The dashboard renders the provisional report
+immediately and replaces it in place.
+
+### Latency (4-core CPU, page fetch on)
+
+| Mode | Request | Mean | Breakdown |
+| --- | --- | --- | --- |
+| Fast | `{"use_llm": false}` | **8.3 s** | fetch ~1.9 s, layers ~0.9 s, screenshot ~5.4 s |
+| Full, verdict already fixed | `{"use_llm": true}` | **~11 s** | the fast path; the model is skipped (`llm.not_needed`) because ±15 cannot cross a risk boundary |
+| Full | `{"use_llm": true}` | **~35–48 s** (was 55–62 s) | the above + 20–40 s of `llama3.2` inference |
+| Full, unreachable host | any | ~20 s | connect 8.8 s, domain 10.7 s (overlapped), no screenshot, no model if the score is decided |
+
+The model's share is arithmetic on CPU: `llama3.2:3b` generates at ~5 tokens/s and
+prefills at ~20–48 tokens/s on 2–4 cores, so a 60–120-token JSON verdict cannot
+finish faster than ~15 s. What changed in this release is the waste around it —
+a bounded generation cap, a ~40 % smaller prompt, no re-sent page text on a
+retry, and no model call at all when its bounded ±15 adjustment provably cannot
+move the verdict. See `deploy/README.md` §4d for the measurements and the knobs.
+
+Every response carries `timings` (per phase) and `latency_ms`, so "it is slow" is answerable
+without a profiler. The measured fixes that got it here: domain lookups start *before* the fetch
+is awaited; no screenshot when the fetch failed (saves ~26 s); an 8 s connect cap; and accepting
+the model's own vocabulary (`"Phishing"`, `80` for 0.8) instead of paying for a second inference.
+
+## How a score is produced
+
+```text
+layers  = 0.30·url + 0.30·domain + 0.20·webpage + 0.20·email      (weights normalised from config)
+score   = (1 − 0.15)·layers + 0.15·catboost                     (PREFILTER_WEIGHT = 0.15)
+LLM     = a bounded adjustment (±) plus a written assessment
+verdict = SAFE (<30) · SUSPICIOUS (30–65) · HIGH_RISK (≥65)
+```
+
+The pre-filter's share is deliberately capped below 0.5 so a lone lexical score cannot drag a clean
+multi-layer analysis into SUSPICIOUS on its own. The LLM cannot invent indicators: it receives the
+deterministic evidence and returns a structured verdict (`verdict`, `phishing_likelihood`,
+`confidence`, `key_indicators`, `reasoning_summary`, `recommended_action`, `score_adjustment`).
+Untrusted page text is passed as data, never as instructions — the prompt-injection sample in the
+dashboard exercises exactly that.
+
+### When a layer cannot run
+
+A scan never fails because a layer is missing; it discloses it:
+
+| Situation | Report says |
+| --- | --- |
+| Ollama down / model missing / unparsable output | `llm.deterministic_fallback` + rules-only assessment |
+| Model slot busy (`MAX_CONCURRENT_LLM_SCANS`) | `llm.busy` — deterministic verdict stands |
+| Verdict already fixed by the layers (±15 cannot cross a boundary) | `llm.not_needed` + "Local model: not consulted" — a decision, not a fault |
+| Model exceeded `LLM_TIMEOUT_SECONDS` | `llm.timeout` |
+| Playwright missing or render blocked | screenshot note inside the visual card |
+| Host answered 404/5xx | "no page was served — an error body is the server's own notice" |
+| DNS failure | report with URL/domain/pre-filter evidence, not an error |
+| No trained CatBoost model | `ml.deterministic_fallback`; pre-filter left out of the score |
+
+## ML pipeline (CatBoost pre-filter)
+
+The model is trained offline and loaded at startup from `backend/models/prefilter.cbm`. **No model
+is bundled with this repo** — until you train one, every analysis reports
+`ml.deterministic_fallback` and the pre-filter is deliberately excluded from the score.
+
+```bash
+python scripts/data/download_data.py --confirm        # opt-in public feeds
+python scripts/data/fetch_benign_urls.py --confirm    # real benign URLs with paths
+python scripts/data/prepare_dataset.py
+python ml/training/train_prefilter.py                 # gated: only deploys if it clears the bar
+python ml/evaluation/report.py                        # ml/evaluation/reports/latest.{json,md}
+```
+
+Skipping step 2 is the classic mistake: without path-bearing benign URLs the model learns
+"URL has a path ⇒ phishing" and flags ordinary pages.
+
+**Two gate tiers**, named rather than silently tuned:
+
+| Tier | Certifies | Used for |
+| --- | --- | --- |
+| `strict` | precision-grade, fit to decide alone | short-circuiting later layers |
+| `triage` (default) | fit to be one disclosed signal among several | the 15%-weighted pre-filter |
+
+A rejected candidate leaves the deployed model untouched and writes its reasons to
+`ml/evaluation/reports/train_gate.md`. Every response also carries provenance — `gate.tier`,
+`gate.passed`, `split`, `metrics`, `decision_threshold`, `score_above_threshold`, `trained_at` — so
+a score can be audited without training anything. Feature contract and gate maths:
+[`ml/README.md`](ml/README.md).
+
+## Browser extension
+
+Manifest V3, React popup, Shadow-DOM UI, no remote code. Two manifests: `manifest.json` (Chrome/Edge,
+`background.service_worker`) and `manifest.firefox.json` (`background.scripts` + explicit
+`data_collection_permissions`, required by Firefox 140+).
+
+```bash
+cd extension
+npm ci
+npm test                 # 201 unit tests
+npm run typecheck
+npm run build            # dist/            — Chrome/Edge
+npm run build:firefox    # dist-firefox/    — the Firefox flavour
+npm run zip:firefox      # phishbrain-extension-firefox.zip  (AMO / self-hosting)
+npm run zip:chrome       # phishbrain-extension-chrome.zip
+```
+
+The Firefox bundle is a **separate artefact** on purpose: loading `dist/` in Firefox produces
+`Error processing background.service_worker` and an add-on whose worker never starts, so nothing is
+scanned. Always load `dist-firefox/`.
+
+### Chrome / Edge / Brave
+
+1. `chrome://extensions/`
+2. Enable **Developer mode** (top right).
+3. **Load unpacked** → select `extension/dist`.
+
+### What it does
+
+- Scans every page you open, and every message you open on Gmail / Outlook Web (sender, Reply-To,
+  display name, subject, body, `text|href` link pairs, quoted-content flag).
+- **Toolbar badge** `OK` / `!` / `!!` with score in the tooltip.
+- **In-page banner** on SUSPICIOUS/HIGH_RISK pages: *View Detailed Analysis*, *Go Back*,
+  *Proceed Anyway* (allowlists the host).
+- **In-message verdict card** inside Gmail/Outlook instead of a page banner (a banner there covered
+  the message header and offered to allowlist the mailbox itself).
+- **Desktop notification** on HIGH_RISK, so a hit reaches you from another tab.
+- **Opt-in SOC/SIEM webhook** for every detection at/above your threshold, with the delivery result
+  shown back in Options.
+
+The popup is a full report, not a badge: verdict, score, confidence, latency, ID, deduplicated
+"why", every layer with raw evidence, the pre-filter card (score, weight, gate tier), the LLM
+assessment, the visual/brand-clone card with the captured screenshot, the recommended action and any
+degraded layers. Opening it on an unscanned tab starts the scan and shows a quick deterministic
+verdict first.
+
+### Configuration
+
+Everything lives in the Options page, persisted with `storage.local` in both browsers:
+
+| Setting | Default (production build) | Meaning |
+| --- | --- | --- |
+| Backend URL | `https://api.phishbrain007.app` | full pipeline |
+| Dashboard URL | `https://phishbrain007.app` | report links; hosted endpoints are derived from it |
+| Fall back to hosted live scans | on | `/api/public/scan` on the dashboard origin |
+| Auto-scan | on | scan pages as you browse |
+| Warning threshold | 50 | banner/notification cut-off |
+| Allowlist | empty | domains never scanned |
+| Screenshots | off (opt-in) | capture the visible tab for the visual layer |
+| Real-time alerts | off (opt-in) | POST SOC events to your webhook |
+
+A **development build** (`npm run dev`, `vite build --mode development`, the test suite) defaults to
+`http://127.0.0.1:8000` / `http://127.0.0.1:8080` instead. A release build can override either with
+`VITE_PHISHBRAIN_BACKEND_URL` / `VITE_PHISHBRAIN_DASHBOARD_URL`:
+
+```bash
+VITE_PHISHBRAIN_BACKEND_URL=https://api.example.app \
+VITE_PHISHBRAIN_DASHBOARD_URL=https://example.app \
+npm run build:firefox
+```
+
+### "Open Dashboard" opens the report, not the home page
+
+After a scan, the popup button, the banner's *View Detailed Analysis* and the mail card's *Open full
+report* all link to `<dashboard>/analysis?url=<scanned page>`. The dashboard re-runs the pipeline for
+that address through whichever engine the browser can reach, so the report you land on includes the
+screenshot, pre-filter and model verdict — including for results that came from the hosted fallback,
+whose analysis ids no backend has ever stored.
+
+## Firefox: temporary and permanent install
+
+The complete version, with the pre-flight checks and Mozilla's own validator, is in
+[`extension/README.md`](extension/README.md#install-in-firefox). Short form:
+
+**Temporary (lasts until Firefox closes — for testing):**
+
+1. `cd extension && npm ci && npm run build:firefox`
+2. Open `about:debugging#/runtime/this-firefox`.
+3. **Load Temporary Add-on…** → pick `extension/dist-firefox/manifest.json`
+   (the `.zip` works too) → **Open**.
+4. Pin **PhishBrain007** from the extensions menu and open any `https://` page.
+
+**Permanent (survives restarts, installs on any device):**
+
+1. `npm run build:firefox && npm run zip:firefox`
+2. Sign it — either
+   - **AMO (free, listed or unlisted):** <https://addons.mozilla.org/developers/> → *Submit a New
+     Add-on* → upload `phishbrain-extension-firefox.zip`; or
+   - **Self-signed XPI (free):** create AMO API keys, then
+     `npx web-ext sign --source-dir dist-firefox --api-key … --api-secret …`
+3. Install the signed `.xpi`: Firefox opens it from `file://`, or serve it over HTTPS. AMO-signed
+   builds update themselves (`browser_specific_settings.gecko.update_url` for self-hosted).
+4. Fleet/lab machines: `policies.json` with `ExtensionSettings → installation_mode:
+   force_installed` and your signed XPI URL.
+
+An unsigned `.zip`/`.xpi` can only ever be a temporary install — Firefox has no "trust this
+permanently" switch, which is why signing is the step that makes it permanent.
+
+## Deployment
+
+Everything about the public, zero-cost target — `phishbrain007.app` on Cloudflare Workers with the
+full pipeline on an Oracle Always Free VM behind a Cloudflare Tunnel — is in
+[`deploy/README.md`](deploy/README.md): domain, Worker deploy, VM, tunnel, compose, verification,
+rate limiting and backups.
+
+### Single host with Compose
+
+Any Linux box / VPS with 4 CPU and 8 GB RAM (16 GB for an 8B model):
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+```
+
+Services: `frontend` :8080, `backend` :8000, `postgres`, `valkey`, `ollama`. Verified end to end:
+`/api/v1/health` reports `database`, `cache` and `ollama` all `ok`, a live `netflix.com` scan returns
+a SAFE verdict **with** an LLM assessment and a screenshot comparison, and the result is persisted
+(so History and Alerts are populated).
+
+### Hardening checklist
+
+- Change `POSTGRES_PASSWORD`; publish no `ports:` for Postgres/Valkey (the prod compose publishes
+  none at all and reaches the backend through a Cloudflare Tunnel).
+- Size `MAX_CONCURRENT_LLM_SCANS` / `MAX_CONCURRENT_VISUAL_SCANS` to the host. The Chromium render
+  and the model are both CPU-bound; with no ceiling, concurrent visitors make *every* scan miss its
+  deadline. Extra requests queue for `SCAN_QUEUE_TIMEOUT_SECONDS`, then return the deterministic
+  verdict labelled `llm.busy` / `visual.busy`.
+- Keep `STORE_RAW_EMAIL=false` and short `RETENTION_DAYS` / `VISUAL_RETENTION_DAYS`. On a shared
+  box, `VISUAL_RETENTION_DAYS=0` and `VISUAL_SCREENSHOT_MODE=wireframe` keep the comparison visible
+  without storing a readable copy of a stranger's page.
+- Restrict `CORS_ORIGIN_REGEX` to your dashboard origin plus the extension schemes
+  (`chrome-extension://`, `moz-extension://`); loopback and RFC 1918 are allowed by default.
+- Back up with `pg_dump` on a cron and snapshot the `ollama_data` volume.
+- Put a rate limit on `/api/` at the edge (one free Cloudflare WAF rule is enough).
+
+### Dashboard-only build
+
+The default build target is a Cloudflare Worker. For a Node/Bun server build:
+
+```bash
+NITRO_PRESET=node-server bun run build        # writes .output/server/index.mjs
 PORT=8080 HOST=0.0.0.0 bun .output/server/index.mjs
 ```
 
-Verified: after a `node-server` build, `/analysis`, `/history` and `/settings` all return `200`.
-To deploy the Worker target instead, build with the default preset and use `npx wrangler deploy`
-(`.output/nitro.json` records the preset and the preview/deploy commands).
+`vite preview` does not serve this app. A dashboard-only deployment scans with the reduced server
+engine and says so in the report banner.
+
+## Verify it yourself
+
+```bash
+# 1. the API is up and names every dependency
+curl -s localhost:8000/api/v1/health
+
+# 2. a full pipeline scan (screenshot + pre-filter + LLM)
+curl -s -X POST localhost:8000/api/v1/analyze/url \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com","fetch_page":true}' \
+  | python -c "import json,sys; d=json.load(sys.stdin); print(d['risk_level'], d['threat_score'], d['llm_assessment']['model'], d['prefilter']['model_trained'])"
+
+# 3. the same scan, streamed
+curl -N -X POST localhost:8000/api/v1/analyze/url/stream \
+  -H 'Content-Type: application/json' -d '{"url":"https://example.com"}'
+
+# 4. an unregistered host is a REPORT (200), not a 5xx
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/api/v1/analyze/url \
+  -H 'Content-Type: application/json' -d '{"url":"https://this-domain-does-not-exist-9z8x.test"}'
+
+# 5. the dashboard serves the analysis route with a deep link
+curl -s -o /dev/null -w '%{http_code}\n' 'http://localhost:8080/analysis?url=https%3A%2F%2Fexample.com'
+
+# 6. the test suites
+cd backend && venv/Scripts/python.exe -m pytest -q
+cd ../extension && npm test && npm run typecheck && npm run check:content
+cd .. && ./node_modules/.bin/tsc --noEmit
+```
+
+A healthy full scan shows `llm_assessment.model` naming the model (`llama3.2`) and
+`prefilter.model_trained: true` when a trained model is deployed.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Report says `LLM unavailable … deterministic rule-based evidence only` while `/health` says `ollama: ok` | `OLLAMA_MODEL` names a tag that was never pulled (`llama3.2:3b` vs `llama3.2`) | `ollama list`, then pull exactly what `OLLAMA_MODEL` says (the compose init script does this) |
+| Every scan re-loads the model / first scan very slow | model evicted between scans | keep `LLM_KEEP_ALIVE=30m`, `LLM_WARMUP_ON_STARTUP=true` |
+| `llm.busy` under load | single model slot on a small box | expected; raise `MAX_CONCURRENT_LLM_SCANS` only with the CPU to back it |
+| Visual card says "unavailable" | Playwright browsers not installed, or the page 404'd | `python -m playwright install chromium`; a 404 has no page to compare |
+| Popup says "Backend unavailable" | backend down *and* hosted endpoint unreachable | start the backend, or fix the Dashboard URL |
+| Popup says "Hosted fallback" | no local backend, hosted scan answered | correct for a hosted-only install |
+| Firefox: nothing is scanned | `dist/` loaded instead of `dist-firefox/` | `npm run build:firefox`, load `dist-firefox/manifest.json` |
+| Firefox: add-on disappears after restart | temporary install | sign the package (AMO or `web-ext sign`) |
+| Dashboard: "backend ok" but reduced layers | the browser reached a different backend host | Settings → Backend URL; the report banner names the engine that answered |
+| `vite preview` shows nothing | wrong preset | use `.output/server/index.mjs` or `wrangler` |
+
+## Documentation map
+
+| File | What it covers |
+| --- | --- |
+| [`workingexplaination.txt`](workingexplaination.txt) | **Everything**: technologies and why, request workflows, scoring, data model, security, failure modes, file map |
+| [`deploy/README.md`](deploy/README.md) | Zero-cost public deployment on `phishbrain007.app` |
+| [`extension/README.md`](extension/README.md) | Extension build, store submission, source packaging for review |
+| [`ml/README.md`](ml/README.md) | Pre-filter feature contract and the deployment gate |
+| [`AGENTS.md`](AGENTS.md) | Repository conventions for automated contributors |
 
 ## Academic & Ethics Note
 
-PhishBrain is a research tool developed for academic and educational purposes. It is designed to demonstrate the feasibility of local-first phishing detection. It does not utilize any proprietary APIs (like Google Safe Browsing or OpenAI) to ensure complete data sovereignty. Users should use this tool responsibly and not rely solely on it for critical security decisions.
+PhishBrain is a research and teaching tool demonstrating local-first phishing detection. It uses no
+proprietary threat API, and it should not be the only defence behind a real security decision.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## PhishBrain007 — custom domain, alerts, email analysis and screenshots
-
-### 1. Publish on your own domain (`www.phishbrain07.app`)
-
-1. Publish the project in Lovable (slug `phishbrain007`) — it goes live at `https://phishbrain007.lovable.app`.
-2. Buy/own `phishbrain07.app`, then in Lovable open **Project Settings → Domains → Connect domain** and add
-   both `phishbrain07.app` and `www.phishbrain07.app`. Set DNS at your registrar:
-   - `A  @    185.158.133.1`
-   - `A  www  185.158.133.1`
-   - `TXT _lovable  <value shown in the connect dialog>`
-3. Wait for verification + automatic TLS. Your public API surface is then:
-   - `https://www.phishbrain07.app/api/public/scan` — POST `{"url": "..."}` (live page scan)
-   - `https://www.phishbrain07.app/api/public/email-scan` — POST sender/subject/body + links
-     (email-layer analysis; the first link is live-scanned server-side). Both are defined in
-     `src/routes/api/public/` and ship inside the dashboard deploy.
-4. The extension already ships with both URLs as defaults
-   (`extension/src/services/api.ts` — `DEFAULT_CLOUD_SCAN_URL`, `DEFAULT_CLOUD_EMAIL_URL`) and both
-   manifests list the domains in `host_permissions`. Rebuild with `cd extension && bun run build`.
-5. Firefox: `cd extension && bun run build && bun run zip:firefox`, then upload
-   `extension/phishbrain-extension-firefox.zip` at https://addons.mozilla.org/developers/ (free).
-   Chrome/Edge users load `extension/dist` unpacked, or sign the same code for the Web Store.
-
-### 2. Real-time alerts
-
-Options → **Real-time alerts (opt-in)**: enable it and paste a webhook URL (Slack workflow, n8n,
-email relay, SIEM). Every detection at or above your banner threshold is POSTed as a JSON SOC event
-(`analysis_id`, `url`, `domain`, `threat_score`, `risk_level`, `indicators`, `recommended_action`).
-It is off by default, so nothing leaves the browser unless the user opts in.
-
-### 3. Screenshot / brand-clone analysis
-
-There are two independent visual paths:
-
-**Client-side (recommended, works everywhere incl. Firefox with no backend).**
-Options → **Screenshot & visual clone analysis (opt-in)**. The extension captures the visible tab
-with `tabs.captureVisibleTab`, computes a 64-bit perceptual hash on-device
-(`extension/src/background/phash.ts` — same format as the Python backend) and compares it against
-`extension/data/reference_hashes.json`, which ships with 16 real brand-login fingerprints and is
-bundled into the add-on as `reference_hashes.json` (Adobe is a documented, testable gap — see below).
-A layout match on a non-official domain adds a “possible
-visual clone” indicator and re-scores the result. A **downscaled thumbnail of the exact screenshot**
-the verdict was scored on is kept with the result and shown in the toolbar popup's _Visual /
-brand-clone analysis_ card, so the evidence is visible rather than only scored. When the brand is
-matched, the popup shows the captured page **side by side with the bundled reference** for that
-brand (`extension/data/reference_thumbnails.json`, written by the same generator). Options → **Stored
-screenshot style** can render the thumbnail as a **wireframe** — black-on-white layout edges — which
-keeps the page's structure while dropping colour and legible text, so evidence can be shown without
-retaining a readable copy of the page. Screenshots never leave the device. Because brand
-pages drift and browsers render differently, the detector re-learns each brand's fingerprint when
-you visit its genuine login page (same engine = accurate matches).
-
-Regenerate the fingerprints any time with the installed Chrome (no Docker, no Python):
-
-```bash
-bun scripts/data/generate_reference_hashes.ts   # writes extension/data/reference_hashes.json + reference_thumbnails.json
-BRANDS="paypal,google" bun scripts/data/generate_reference_hashes.ts   # capture a subset
-CAPTURE_ATTEMPTS=3 bun scripts/data/generate_reference_hashes.ts       # retry bot-walled brands more times
-```
-
-Captures that are uniform _or_ near-blank (bot walls, cookie interstitials) are rejected, so a
-degenerate screenshot is never shipped as a brand's reference. A rejected capture also **drops any
-stale entry from a previous run** — otherwise a brand whose capture is now correctly refused would
-keep an old, equally-useless hash and the file would claim a reference that was never captured.
-
-Each brand is retried with a realistic browser identity — `AutomationControlled` disabled, `en-US`
-locale, and a **persistent `--user-data-dir` profile** so consent cookies earned on the first attempt
-are replayed on the next, which is what gets past most interstitials. Persistent failures are not
-silent: the run writes `extension/data/reference_capture_report.json` and lists the brands it could
-not capture, and any brand that fails without a matching entry in
-`extension/data/known_reference_gaps.json` is flagged as an undocumented failure.
-
-`known_reference_gaps.json` is the curated list of brands that genuinely cannot be captured from a
-headless browser — currently **Adobe**, whose homepage and sign-in page both answer a
-near-blank bot wall. `extension/tests/reference-gaps.test.ts` keeps it honest: a documented gap must
-not also ship a reference or a thumbnail (the stale-entry bug above), every gap must carry a reason,
-a status and a mitigation, and every shipped hash must be a valid 64-bit pHash. If Adobe is ever
-captured for real, removing the gap entry makes the test pass again.
-
-**Server-side (optional, deeper).** The self-hosted backend can still screenshot with Playwright and
-compare inside `backend/app/analyzers/webpage/visual.py`. Seed it with the same file by running the
-Python generator inside the Docker image:
-
-```bash
-python scripts/data/generate_reference_hashes.py   # Playwright captures; same output file
-```
-
-The backend also returns a downscaled data URL of the screenshot it compared, which the dashboard's
-_Visual analysis_ card renders, so backend and extension show the same evidence. Control it with
-`VISUAL_SCREENSHOT_MODE`: `pixels` (default, downscaled JPEG), `wireframe` (edge-only PNG — layout
-without colour or readable text), or `off` (nothing leaves the server). `VISUAL_SCREENSHOT_MAX_WIDTH`
-(default 480) caps the size.
-
-**Structural comparison, not just a hash distance.** When a brand reference is available the popup
-no longer stops at a single perceptual-hash distance. Both images are reduced to edge maps (layout
-without colour or text), normalised to a common grid, and compared region by region
-(`extension/src/lib/region-similarity.ts`): the card shows the two edge maps **overlaid** — amber
-where only this page has structure, blue where only the reference does, white where they agree — a
-per-region **similarity heatmap** (8×5 cells, red→green, each cell the Dice overlap of that region's
-edges), and a single comparison score below the side-by-side screenshots. That turns “distance 24”
-into a picture of _where_ the pages line up and where they do not.
-
-### 3b. Visual-evidence retention
-
-A stored screenshot is the most sensitive artefact PhishBrain keeps, so it is purged on its own,
-shorter clock than the analysis it belongs to:
-
-- `VISUAL_RETENTION_DAYS` (default `7`) — how long a stored screenshot is kept. After that the
-  **image is dropped while the analysis record, score and indicators are kept**. `0` means “store
-  none”: every sweep strips screenshots immediately.
-- The sweep runs at startup and every `VISUAL_PURGE_INTERVAL_MINUTES` (default `360`), and can be
-  disabled with `VISUAL_AUTO_PURGE_ENABLED=false`. The same startup pass now also enforces
-  `RETENTION_DAYS` for analyses — which had been configured but never actually applied.
-- **One-click “Clear all visual evidence”** exists in both surfaces:
-  - Dashboard → _Settings → Privacy & data_ → `POST /api/v1/visual-evidence/clear`.
-  - Extension → _Options → Screenshot & visual clone analysis_ → **Clear all visual evidence**
-    (removes stored thumbnails from every result and forgets the learned brand fingerprints).
-
-  Both keep the analyses themselves; only the images go. `GET /api/v1/visual-evidence/policy` reports
-  the active window so the dashboard shows the real configured value. The extension shows its own
-  retention field (`visualRetentionDays`, default 7) and a live count of what is stored.
-
-Note: brand pages change over time (consent banners, A/B tests) and hash distances across browser
-engines are noisier than within one engine — treat visual matches as one evidence layer among many,
-not as a standalone verdict.
-
-### 4. Email analysis
-
-- Dashboard: `/analysis` now has a **Email message** tab — paste From / Reply-To / display name /
-  subject / body. Sender-domain mismatch, brand impersonation, urgency and credential-request
-  language are scored, and the first link in the body is fetched live for URL, domain and webpage
-  evidence.
-- Extension: on Gmail and Outlook Web the content script parses the open message (sender,
-  reply-to, display name, subject, body, links; SPF/DKIM/DMARC are marked “not available from
-  browser context” — they can only be verified by a mail server) and re-runs whenever you open a
-  conversation (SPA-aware: hash/navigation changes + a light DOM poll). The scan first tries the
-  local backend's `/api/v1/analyze/email`; with the hosted fallback enabled it posts to
-  `…/api/public/email-scan` instead, so email analysis works with nothing but the published
-  dashboard. Results appear in the toolbar badge, the popup, and as a banner when the score
-  crosses your threshold.
+MIT — see [LICENSE](LICENSE).

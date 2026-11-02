@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -6,19 +6,24 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Install system dependencies required by Python packages and Playwright.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl \
+    build-essential \
+    curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt .
 RUN pip install -r requirements.txt
 
-# Install Playwright browsers
-RUN playwright install chromium --with-deps
+# `--with-deps` installs the shared libraries Chromium links against (libnss3,
+# libglib, libgbm, libasound, ...). Without it the browser downloads fine but
+# refuses to launch inside this image, so every scan reported "Visual analysis:
+# unavailable" with a BrowserType.launch library list instead of a screenshot.
+RUN playwright install --with-deps chromium
 
 COPY backend/ ./
 COPY ml/ ./ml/
-# Brand login fingerprints used by the visual (perceptual-hash) analyzer.
 COPY data/ ./data/
 
 EXPOSE 8000

@@ -9,7 +9,14 @@ import {
   type ScreenshotPrivacy,
   type Settings,
 } from "../lib/settings";
-import { DEFAULT_BACKEND_URL, DEFAULT_DASHBOARD_URL, getHealth } from "../services/api";
+import {
+  DEFAULT_BACKEND_URL,
+  DEFAULT_DASHBOARD_URL,
+  backendCandidates,
+  findReachableBackend,
+  getHealth,
+} from "../services/api";
+import { describeSource, resolveHostedEmail, resolveHostedScan } from "../lib/hosted";
 import { runtimeApi } from "../lib/browser";
 
 type ConnectionStatus = "idle" | "checking" | "ok" | "error";
@@ -20,6 +27,47 @@ interface VisualEvidenceStats {
   screenshots: number;
   learned: number;
   retentionDays: number;
+}
+
+/** What the background reports after attempting a webhook delivery. */
+interface AlertDeliveryResult {
+  delivered: boolean;
+  status: number | null;
+  attempts: number;
+  error: string | null;
+  at: number;
+}
+
+/** The stored outcome of the most recent alert, for the status line below. */
+interface LastAlertRecord extends AlertDeliveryResult {
+  url: string;
+  analysis_id: string;
+  threshold: number;
+  test: boolean;
+}
+
+function formatWhen(at: number): string {
+  const secs = Math.max(0, Math.round((Date.now() - at) / 1000));
+  if (secs < 60) return `${secs}s ago`;
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return new Date(at).toLocaleString();
+}
+
+/**
+ * One sentence that says whether the webhook actually accepted the event.
+ * "Enabled" on its own is not evidence — this is.
+ */
+function describeDelivery(record: LastAlertRecord): string {
+  const label = record.test ? "Test alert" : "Latest alert";
+  const when = formatWhen(record.at);
+  if (record.delivered) {
+    return `${label} delivered (HTTP ${record.status}) ${when}.`;
+  }
+  const status = record.status !== null ? ` (HTTP ${record.status})` : "";
+  return `${label} FAILED ${when}${status} — ${record.error ?? "unknown error"}`;
 }
 
 function Options() {
@@ -34,6 +82,8 @@ function Options() {
   const [visualStats, setVisualStats] = useState<VisualEvidenceStats | null>(null);
   const [clearingVisual, setClearingVisual] = useState(false);
   const [visualNotice, setVisualNotice] = useState<string | null>(null);
+  const [lastAlert, setLastAlert] = useState<LastAlertRecord | null>(null);
+  const [testingAlert, setTestingAlert] = useState(false);
 
   const refreshVisualStats = useCallback(async () => {
     try {
@@ -46,14 +96,51 @@ function Options() {
     }
   }, []);
 
+  const refreshLastAlert = useCallback(async () => {
+    try {
+      const stored = await runtimeApi.sendMessage<{ type: string }, LastAlertRecord | null>({
+        type: "LAST_ALERT",
+      });
+      setLastAlert(stored ?? null);
+    } catch {
+      setLastAlert(null);
+    }
+  }, []);
+
   useEffect(() => {
     void (async () => {
       const stored = await getSettings();
       setLocalSettings(stored);
       setLoaded(true);
       void refreshVisualStats();
+      void refreshLastAlert();
     })();
-  }, [refreshVisualStats]);
+  }, [refreshVisualStats, refreshLastAlert]);
+
+  const handleTestAlert = useCallback(async () => {
+    setTestingAlert(true);
+    try {
+      const result = await runtimeApi.sendMessage<{ type: string }, AlertDeliveryResult>({
+        type: "TEST_ALERT",
+      });
+      setLastAlert({ ...result, url: "", analysis_id: "test-alert", threshold: 0, test: true });
+      await refreshLastAlert();
+    } catch {
+      setLastAlert({
+        delivered: false,
+        status: null,
+        attempts: 0,
+        error: "The extension background did not answer.",
+        at: Date.now(),
+        url: "",
+        analysis_id: "test-alert",
+        threshold: 0,
+        test: true,
+      });
+    } finally {
+      setTestingAlert(false);
+    }
+  }, [refreshLastAlert]);
 
   const handleClearVisualEvidence = useCallback(async () => {
     setClearingVisual(true);
@@ -84,10 +171,25 @@ function Options() {
   const handleTestConnection = useCallback(async () => {
     setConnectionStatus("checking");
     setConnectionMessage("");
+    // Probe the same candidate list the worker uses, so a healthy backend on
+    // this computer is not reported as unreachable just because the Backend URL
+    // field still holds a deployed address.
+    const reachable = await findReachableBackend(settings.backendUrl);
+    if (!reachable) {
+      setConnectionStatus("error");
+      setConnectionMessage(
+        `No backend answered. Tried ${backendCandidates(settings.backendUrl).join(" and ")}.`,
+      );
+      return;
+    }
     try {
-      const health = await getHealth(settings.backendUrl);
+      const health = await getHealth(reachable);
       setConnectionStatus("ok");
-      setConnectionMessage(`Connected. Status: ${health.status ?? "ok"}`);
+      const suffix =
+        reachable === settings.backendUrl.trim().replace(/\/+$/, "")
+          ? ""
+          : ` (on this computer — the Backend URL field points elsewhere)`;
+      setConnectionMessage(`Connected to ${reachable}. Status: ${health.status ?? "ok"}${suffix}`);
     } catch (err) {
       setConnectionStatus("error");
       setConnectionMessage(err instanceof Error ? err.message : "Backend unavailable.");
@@ -97,31 +199,46 @@ function Options() {
   const handleTestHosted = useCallback(async () => {
     setHostedStatus("checking");
     setHostedMessage("");
+    // Probe the URL that would actually be used, not the raw field: the
+    // endpoint is derived from the dashboard URL on most installations.
+    const endpoint = resolveHostedScan(settings).url;
+    if (!endpoint) {
+      // Nothing to probe: an empty URL would fetch the extension's own origin
+      // and report a bogus "HTTP 200".
+      setHostedStatus("error");
+      setHostedMessage(
+        "No hosted endpoint yet — deploy the dashboard and set its URL above (or run the local backend).",
+      );
+      return;
+    }
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 8000);
       let res: Response;
       try {
-        res = await fetch(settings.cloudScanUrl, { method: "OPTIONS", signal: controller.signal });
+        res = await fetch(endpoint, { method: "OPTIONS", signal: controller.signal });
       } finally {
         clearTimeout(timer);
       }
       if (res.ok || res.status === 204) {
         setHostedStatus("ok");
-        setHostedMessage("Hosted live-scan endpoint is answering.");
-      } else {
-        setHostedStatus("error");
-        setHostedMessage(
-          `Hosted endpoint answered with HTTP ${res.status}. The dashboard may not be deployed with the public scan routes.`,
-        );
+        setHostedMessage(`Hosted live-scan endpoint is answering at ${endpoint}.`);
+        return;
       }
+      setHostedStatus("error");
+      setHostedMessage(
+        `${endpoint} answered with HTTP ${res.status}. The domain resolves but the public scan routes are not deployed there.`,
+      );
     } catch {
       setHostedStatus("error");
       setHostedMessage(
-        "Hosted fallback is unreachable (domain does not resolve or the deployment is down).",
+        `${endpoint} is unreachable (the domain does not resolve, or the deployment is down).`,
       );
     }
-  }, [settings.cloudScanUrl]);
+  }, [settings]);
+
+  const hostedScan = useMemo(() => resolveHostedScan(settings), [settings]);
+  const hostedEmail = useMemo(() => resolveHostedEmail(settings), [settings]);
 
   const addAllowlistEntry = useCallback(async () => {
     const value = newAllowlistEntry.trim().toLowerCase();
@@ -197,9 +314,13 @@ function Options() {
               setLocalSettings((prev) => ({ ...prev, cloudScanUrl: e.target.value }))
             }
             onBlur={(e) => void persist({ cloudScanUrl: e.target.value })}
-            placeholder="https://www.phishbrain07.app/api/public/scan"
+            placeholder={hostedScan.url}
             className="rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-slate-100"
           />
+          <span className="text-[10px] text-slate-500">
+            Leave this empty to follow your dashboard: currently {describeSource(hostedScan.source)}{" "}
+            → <code className="font-mono">{hostedScan.url}</code>
+          </span>
         </label>
 
         <label className="flex flex-col gap-1 text-xs text-slate-300">
@@ -211,9 +332,13 @@ function Options() {
               setLocalSettings((prev) => ({ ...prev, cloudEmailScanUrl: e.target.value }))
             }
             onBlur={(e) => void persist({ cloudEmailScanUrl: e.target.value })}
-            placeholder="https://www.phishbrain07.app/api/public/email-scan"
+            placeholder={hostedEmail.url}
             className="rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-slate-100"
           />
+          <span className="text-[10px] text-slate-500">
+            Currently {describeSource(hostedEmail.source)} →{" "}
+            <code className="font-mono">{hostedEmail.url}</code>
+          </span>
         </label>
 
         <label className="flex items-center gap-2 text-xs text-slate-300">
@@ -314,9 +439,15 @@ function Options() {
       <section className="flex flex-col gap-3 rounded-lg border border-slate-700 bg-slate-900 p-4">
         <h2 className="text-sm font-semibold">Real-time alerts (opt-in)</h2>
         <p className="text-xs text-slate-400">
-          When enabled, every detection at or above your banner threshold is sent to this webhook as
-          a JSON SOC event (URL, domain, score, indicators). Use it with an email relay, Slack
-          workflow, or your own SIEM. Nothing leaves the browser while this is off.
+          When enabled, every detection at or above your banner threshold is POSTed to this webhook
+          as the same SOC event the dashboard emits — <code className="font-mono">event_id</code>,
+          severity, score, indicators, <code className="font-mono">degraded</code> and the ML
+          pre-filter's contribution. Use it with an email relay, a Slack workflow, or your own SIEM.
+          Nothing leaves the browser while this is off.
+        </p>
+        <p className="text-xs text-slate-400">
+          A webhook that is unreachable or returns an error cannot alert you, so use the button
+          below to send a marked test event and see the exact HTTP answer.
         </p>
         <label className="flex items-center gap-2 text-xs text-slate-300">
           <input
@@ -339,6 +470,43 @@ function Options() {
             className="rounded-md border border-slate-700 bg-slate-950 px-2 py-1.5 text-sm text-slate-100"
           />
         </label>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void handleTestAlert()}
+            disabled={testingAlert || !settings.alertWebhookUrl.trim()}
+            className="rounded-md border border-sky-600 bg-sky-900/40 px-3 py-1.5 text-xs font-semibold text-sky-200 hover:bg-sky-900/70 disabled:opacity-50"
+          >
+            {testingAlert ? "Sending…" : "Send test alert"}
+          </button>
+          {!settings.alertWebhookUrl.trim() ? (
+            <span className="text-[11px] text-slate-500">
+              Set a webhook URL first — there is nothing to send to.
+            </span>
+          ) : null}
+        </div>
+        {lastAlert ? (
+          <p
+            aria-live="polite"
+            className={`rounded-md border px-3 py-2 text-xs ${
+              lastAlert.delivered
+                ? "border-emerald-700/60 bg-emerald-950/30 text-emerald-300"
+                : "border-red-700/60 bg-red-950/30 text-red-300"
+            }`}
+          >
+            {describeDelivery(lastAlert)}
+            {lastAlert.delivered && lastAlert.attempts > 1
+              ? ` Delivered on attempt ${lastAlert.attempts}.`
+              : ""}
+          </p>
+        ) : (
+          <p className="text-[11px] text-slate-500">No alert has been sent yet.</p>
+        )}
+        <p className="text-[11px] text-slate-500">
+          Alerts use the banner threshold ({settings.riskThreshold}) so what warns you and what
+          pages your SOC cannot drift apart. A failing webhook never interrupts scanning, and each
+          detection retries once before it is reported as failed here.
+        </p>
       </section>
 
       <section className="flex flex-col gap-3 rounded-lg border border-slate-700 bg-slate-900 p-4">

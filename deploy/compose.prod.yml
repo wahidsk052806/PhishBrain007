@@ -1,0 +1,119 @@
+# Production stack for a public deployment (e.g. api.phishbrain007.app).
+#
+#   cd deploy && cp env.production.example .env   # edit secrets + origins
+#   docker compose -f compose.prod.yml up -d --build
+#
+# Differences from the development `../docker-compose.yml`, on purpose:
+#   - no `frontend` service: the dashboard is deployed to Cloudflare Workers
+#     (it is a Worker build, not a Bun server — see README "Part 2.C");
+#   - no host port mappings: the only way in is the Cloudflare Tunnel, so the
+#     API host has no open inbound ports and no TLS certificate to renew;
+#   - restart policies, log rotation and memory ceilings, because this runs
+#     unattended on a free-tier VM;
+#   - Postgres/Valkey/Ollama are never published, only reachable on the compose
+#     network.
+
+name: phishbrain
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-phishbrain}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      POSTGRES_DB: ${POSTGRES_DB:-phishbrain}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  valkey:
+    image: valkey/valkey:7-alpine
+    restart: unless-stopped
+    # The cache is a speed-up, not a source of truth: cap it so a scan storm
+    # cannot page the LLM weights out of RAM.
+    command: ["valkey-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *logging
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      # The same name is used by the pull on first boot and by the backend, so
+      # they can never disagree.
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:3b}
+      # Keep the model resident: reloading it per scan costs more than the scan.
+      - OLLAMA_KEEP_ALIVE=30m
+    volumes:
+      - ollama_data:/root/.ollama
+      - ../docker/ollama-init.sh:/usr/local/bin/ollama-init.sh:ro
+    entrypoint: /usr/local/bin/ollama-init.sh
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+    logging: *logging
+
+  backend:
+    build:
+      # Repo root: the image copies backend/, ml/ and data/ from there.
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-phishbrain}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-phishbrain}
+      CACHE_URL: redis://valkey:6379/0
+      OLLAMA_BASE_URL: http://ollama:11434
+      APP_ENV: production
+    # Chromium is the reason for this: without a large enough /dev/shm it
+    # crashes mid-render and every scan reports "visual: unavailable".
+    shm_size: "1gb"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/api/v1/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    logging: *logging
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    # Token from Cloudflare Zero Trust -> Networks -> Tunnels -> your tunnel.
+    # Nothing is published on the host: the tunnel dials out to Cloudflare, and
+    # Cloudflare terminates TLS for api.phishbrain007.app.
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN:?set TUNNEL_TOKEN in deploy/.env}
+    depends_on:
+      backend:
+        condition: service_started
+    logging: *logging
+
+volumes:
+  postgres_data:
+  ollama_data:

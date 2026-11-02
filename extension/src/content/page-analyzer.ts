@@ -4,6 +4,8 @@
  * signals and small, sanitized text snippets, all size-capped.
  */
 
+import { unwrapMailRedirect } from "./mail-links";
+
 export const MAX_TEXT_LENGTH = 2000;
 export const MAX_LINKS = 50;
 export const MAX_BRAND_MENTIONS = 20;
@@ -128,7 +130,11 @@ export function summarizePage(
   const linkMismatches: LinkMismatch[] = [];
   for (const a of anchors) {
     if (linkMismatches.length >= MAX_MISMATCHES) break;
-    const hrefHost = getHostname(a.href, url);
+    // Unwrap provider redirectors first: a link routed through
+    // `google.com/url?q=` or Outlook SafeLinks has an href *host* of google.com
+    // or microsoft.com, which would otherwise be compared against the visible
+    // text and reported as a mismatch on any page that uses a redirector.
+    const hrefHost = getHostname(unwrapMailRedirect(a.href), url);
     const visibleText = sanitizeText(a.textContent || "", 100);
     if (!hrefHost || !visibleText) continue;
     // Detect text that looks like a URL/domain but doesn't match the href host

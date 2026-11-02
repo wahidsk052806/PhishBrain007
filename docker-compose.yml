@@ -23,15 +23,14 @@ services:
 
   ollama:
     image: ollama/ollama:latest
+    environment:
+      # The same model the backend is told to use, so the pull on first boot and
+      # the scan requests can never name different models.
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:3b}
     volumes:
       - ollama_data:/root/.ollama
       - ./docker/ollama-init.sh:/usr/local/bin/ollama-init.sh
     entrypoint: /usr/local/bin/ollama-init.sh
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
-      interval: 10s
-      timeout: 10s
-      retries: 10
 
   backend:
     build:
@@ -50,7 +49,7 @@ services:
       valkey:
         condition: service_healthy
       ollama:
-        condition: service_healthy
+        condition: service_started
     ports:
       - "8000:8000"
 

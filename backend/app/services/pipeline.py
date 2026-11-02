@@ -18,10 +18,12 @@ from urllib.parse import urlparse
 
 from app.analyzers.domain.intelligence import analyze_domain
 from app.analyzers.email.analyzer import analyze_email
+from app.analyzers.email.links import analyze_email_links
 from app.analyzers.url.features import analyze_url
 from app.analyzers.webpage.analyzer import analyze_webpage, build_llm_page_digest, fetch_page
 from app.analyzers.webpage.visual import analyze_visual
 from app.cache.store import get_cache
+from app.core.concurrency import scan_slot
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.core.security import SSRFBlockedError, normalize_url_input, sanitize_html_to_text
@@ -29,10 +31,14 @@ from app.db.repository import save_analysis
 from app.llm.ollama_client import get_llm_assessment
 from app.ml.prefilter import get_prefilter
 from app.schemas.analysis import AnalysisResult, LayerEvidence, PrefilterEvidence, RiskLevel
-from app.scoring.engine import score_analysis
+from app.scoring.engine import LLM_ADJUSTMENT_CLAMP, score_analysis
 from app.soc.events import build_soc_event
 
 logger = get_logger(__name__)
+
+# How long a result with a degraded layer may be reused. See the cache write at
+# the end of run_analysis for why this is not simply CACHE_TTL_SECONDS.
+_DEGRADED_CACHE_TTL_SECONDS = 60
 
 
 def _cache_key(kind: str, payload: dict | None = None, target: str = "") -> str:
@@ -150,9 +156,17 @@ async def _attach_visual_evidence(
             analyze_visual(url, screenshot_base64=screenshot_base64, favicon_url=favicon_url),
             timeout=timeout,
         )
+    except asyncio.TimeoutError:
+        # Worth naming separately: a timeout reads as "this page was too slow to
+        # render", which is a different finding from "the browser could not run".
+        degraded.append("visual.timeout")
+        layer.details["visual_indicators"] = [
+            f"Visual comparison did not finish within {timeout:.0f} s, so no screenshot evidence was captured."
+        ]
+        return
     except Exception as exc:  # noqa: BLE001
         degraded.append("visual.error")
-        layer.details["visual_indicators"] = [f"Visual comparison failed: {exc}"]
+        layer.details["visual_indicators"] = [f"Visual comparison failed: {type(exc).__name__}: {exc}"]
         return
 
     if not isinstance(visual, dict):
@@ -229,6 +243,11 @@ async def run_analysis(
     html: str | None = None,
     dom_summary: str | None = None,
     fetch_page_flag: bool = False,
+    # Set by the API layer when the hostname has no DNS records at all. The
+    # scan still runs (URL, domain, ML and LLM layers), but nothing is fetched:
+    # an unregistered domain cannot answer, so "no page" is the finding rather
+    # than a failed scan.
+    unresolved_host: str | None = None,
     screenshot_base64: str | None = None,
     raw_input: dict | None = None,
     skip_llm: bool = False,
@@ -266,6 +285,9 @@ async def run_analysis(
 
     degraded: list[str] = []
     layers: dict[str, LayerEvidence] = {}
+    # Destination evidence for an email's links, when the message carries any.
+    # Kept outside `layers` so the report can name the link it describes.
+    email_link: dict | None = None
 
     cache = get_cache()
     cache_key = _cache_key(input_type, raw_input, target)
@@ -322,14 +344,28 @@ async def run_analysis(
             asyncio.ensure_future(
                 _run_with_timeout(
                     analyze_domain(hostname, timeout=per_layer_timeout),
-                    per_layer_timeout,
+                    # Headroom over the analyzer's own per-lookup budget. It runs
+                    # RDAP, DNS and TLS *concurrently, each allowed the full
+                    # timeout*, so an outer deadline of exactly the same length
+                    # fired the instant any one lookup used its time — and the
+                    # report then said "Domain evidence: Not applicable" for a
+                    # domain that normally resolves in under two seconds.
+                    per_layer_timeout + 2.0,
                     "domain",
                     degraded,
                 )
             )
         )
 
-    prefetch_attempted = bool(url and html is None and fetch_page_flag and dom_summary is None)
+    prefetch_attempted = bool(
+        url
+        and html is None
+        and fetch_page_flag
+        and dom_summary is None
+        # There is nothing to connect to; asking would just burn the fetch
+        # budget to arrive at the answer the guard already has.
+        and not unresolved_host
+    )
     prefetched_html = html
     if prefetch_attempted:
         prefetched = await _run_with_timeout(
@@ -365,12 +401,47 @@ async def run_analysis(
                 links=email_fields.get("links") or [],
                 raw_headers=email_fields.get("raw_headers"),
                 has_attachments=email_fields.get("has_attachments", False),
+                has_quoted_content=email_fields.get("has_quoted_content", False),
             )
         except Exception as exc:  # noqa: BLE001
             degraded.append("email.error")
             logger.warning("Email layer failed", extra={"extra_fields": {"error": str(exc)}})
 
-    if url and (prefetched_html is not None or dom_summary is not None or prefetch_attempted):
+        # An email scan has no page of its own to fetch, so without this the
+        # only thing examined was the text: a message that says nothing alarming
+        # and points one link at a brand-new typosquat scored as safe. The
+        # destination is scored from strings only and never opened (see
+        # analyzers/email/links.py). Its host is looked up concurrently below.
+        try:
+            email_link = await analyze_email_links(email_fields.get("links") or [])
+        except Exception as exc:  # noqa: BLE001
+            degraded.append("email.links")
+            logger.warning("Email link analysis failed", extra={"extra_fields": {"error": str(exc)}})
+        if email_link:
+            layers["url"] = email_link["url_layer"]
+            if email_link.get("domain_host") and not hostname:
+                concurrent_layers.append(
+                    _run_with_timeout(
+                        analyze_domain(
+                            # Tighter than a URL scan's domain budget: an email
+                            # scan has no other work to overlap this with, and
+                            # the extension shows a provisional result first, so
+                            # a slow RDAP answer must not hold up the message.
+                            email_link["domain_host"],
+                            timeout=min(per_layer_timeout, 4.0),
+                        ),
+                        6.0,
+                        "email.link_domain",
+                        degraded,
+                    )
+                )
+
+    if url and (
+        prefetched_html is not None
+        or dom_summary is not None
+        or prefetch_attempted
+        or unresolved_host
+    ):
         concurrent_layers.append(
             _run_with_timeout(
                 analyze_webpage(
@@ -406,17 +477,51 @@ async def run_analysis(
         page_layer.details["page_fetch_failed"] = fetch_failure
         page_layer.details["page_fetch_outcome"] = "failed"
         page_layer.notes = ((page_layer.notes + "; ") if page_layer.notes else "") + fetch_failure
+    elif unresolved_host and "webpage" in layers:
+        # Not a fault: the name has no address, so there is no page to read.
+        # State what that means for the verdict instead of leaving the layer
+        # looking like a missing feature.
+        page_layer = layers["webpage"]
+        explanation = (
+            f"{unresolved_host} does not resolve (no DNS address), so no page could be "
+            "fetched and there was nothing to parse for credential forms or brand "
+            "mismatches. The verdict is based on the URL, the domain registration "
+            "lookup and the local model."
+        )
+        page_layer.details["page_fetch_outcome"] = "unresolved"
+        page_layer.details["page_fetch_failed"] = explanation
+        page_layer.details["dns_unresolved"] = True
+        page_layer.indicators = [explanation]
+        page_layer.notes = explanation
     elif "webpage" in layers and layers["webpage"].unavailable and not prefetch_attempted:
         layers["webpage"].details.setdefault(
             "page_fetch_outcome", "not_requested"
         )
+
+    # The domain layer in an email scan answers "how old is the host this link
+    # points at", not "how old is the sender's domain": say so on the layer, or
+    # the report reads as if the sender had been looked up.
+    if email_link and "domain" in layers:
+        link_domain = layers["domain"]
+        link_domain.details["source"] = "email_link"
+        link_domain.details["corroborative"] = True
+        link_domain.details["email_href"] = email_link["href"]
+        note = (
+            f"Registration evidence for {email_link['domain_host']}, the host of a link in "
+            "the message — not of the sender's own domain."
+        )
+        link_domain.notes = f"{link_domain.notes}; {note}" if link_domain.notes else note
 
     layer_list = list(layers.values())
     phase = mark("collect_ms", phase)
     await emit({"type": "layers", "layer_evidence": layer_snapshot()})
 
     prefilter = get_prefilter()
-    prefilter_result = prefilter.score(_prefilter_features(layers, url))
+    # For an email the only URL available is a link in the message; handing it to
+    # the model is what lets a trained prefilter contribute to a message scan at
+    # all (its features are lexical, so a sender address alone yields nothing).
+    prefilter_target = url or (email_link["href"] if email_link else None)
+    prefilter_result = prefilter.score(_prefilter_features(layers, prefilter_target))
     if not prefilter_result.get("model_trained"):
         degraded.append("ml.deterministic_fallback")
 
@@ -484,13 +589,61 @@ async def run_analysis(
         webpage_summary = dom_summary[: settings.LLM_WEBPAGE_SUMMARY_CHARS]
 
     llm_assessment = None
+    llm_skip_reason: str | None = None
+
+    # Is a model verdict still able to change the answer? Its contribution is
+    # clamped to +/-LLM_ADJUSTMENT_CLAMP, so when the deterministic base score is
+    # more than that clamp away from every risk boundary, no legal adjustment
+    # can cross one. In that case a 3B CPU model costs ~20 s to restate the
+    # verdict the layers already fixed — which is why the model dominated the
+    # latency of scans (measured 49 s of a 51 s scan). This is reported, never
+    # silent: `llm.not_needed` names the reason and the base score.
+    if not skip_llm and settings.LLM_SKIP_WHEN_DECISIVE:
+        base_score = float(provisional["base_score"])
+        floor = settings.SAFE_THRESHOLD - LLM_ADJUSTMENT_CLAMP
+        ceiling = settings.SUSPICIOUS_THRESHOLD + LLM_ADJUSTMENT_CLAMP
+        if base_score < floor:
+            llm_skip_reason = (
+                f"deterministic base score {base_score:.1f}/100 is below {floor:.0f}, the "
+                f"highest a +{LLM_ADJUSTMENT_CLAMP:.0f} model adjustment could reach; the "
+                "verdict is SAFE either way"
+            )
+        elif base_score >= ceiling:
+            llm_skip_reason = (
+                f"deterministic base score {base_score:.1f}/100 is at or above {ceiling:.0f}, so "
+                f"even a -{LLM_ADJUSTMENT_CLAMP:.0f} model adjustment keeps it HIGH_RISK"
+            )
+        if llm_skip_reason:
+            degraded.append("llm.not_needed")
+            marks["llm_skipped_ms"] = 0.0
+            logger.info(
+                "LLM skipped: verdict already fixed",
+                extra={"extra_fields": {"reason": llm_skip_reason, "base_score": base_score}},
+            )
 
     async def _run_llm_layer() -> None:
         nonlocal llm_assessment
+        async with scan_slot("llm") as admitted:
+            if not admitted:
+                # Every model slot is busy and the queue is longer than a scan
+                # may wait: finish without the verdict instead of stacking a
+                # fourth generation onto CPU that is already saturated.
+                degraded.append("llm.busy")
+                return
+            await _generate_llm()
+
+    async def _generate_llm() -> None:
+        nonlocal llm_assessment
         try:
+            # The LLM has its own budget: a CPU model legitimately needs longer
+            # than a page fetch, and reusing the 20 s network deadline cancelled
+            # every generation before it finished (which also aborted Ollama's
+            # model load, so the next scan started from cold again). The margin
+            # lets the client's own timeout fire first and report a real reason.
+            llm_budget = settings.LLM_TIMEOUT_SECONDS + 5.0
             llm_assessment, llm_degraded = await asyncio.wait_for(
                 get_llm_assessment(url, email_summary, webpage_summary, deterministic_evidence),
-                timeout=overall_deadline,
+                timeout=llm_budget,
             )
             if llm_degraded:
                 degraded.append("llm.deterministic_fallback")
@@ -518,21 +671,36 @@ async def run_analysis(
     page_available = prefetched_html is not None or dom_summary is not None
     has_caller_screenshot = bool(screenshot_base64)
     if url and "webpage" in layers and (page_available or has_caller_screenshot):
-        concurrent_tail.append(
-            _timed(
-                "visual_ms",
-                _attach_visual_evidence(
-                    url, layers["webpage"], per_layer_timeout, degraded, screenshot_base64
-                ),
-            )
-        )
+        # Rendering is not a network layer, so it gets its own budget instead of
+        # a slice of the fetch deadline (see VISUAL_TIMEOUT_SECONDS).
+        visual_budget = max(per_layer_timeout, settings.VISUAL_TIMEOUT_SECONDS)
+
+        async def _run_visual_layer() -> None:
+            async with scan_slot("visual") as admitted:
+                if not admitted:
+                    degraded.append("visual.busy")
+                    layers["webpage"].details["visual_indicators"] = [
+                        "Not attempted: every screenshot slot is busy with other scans, "
+                        "so this page was not rendered for the brand comparison."
+                    ]
+                    return
+                await _attach_visual_evidence(
+                    url, layers["webpage"], visual_budget, degraded, screenshot_base64
+                )
+
+        concurrent_tail.append(_timed("visual_ms", _run_visual_layer()))
     elif url and "webpage" in layers:
+        missing_page = fetch_failure or (
+            f"{unresolved_host} does not resolve, so there is no page to render"
+            if unresolved_host
+            else "the page could not be read"
+        )
         layers["webpage"].details["visual_indicators"] = [
             "Not attempted: "
-            + (fetch_failure or "the page could not be read")
+            + missing_page
             + " — there was no rendered page to compare against the brand references."
         ]
-    if not skip_llm:
+    if not skip_llm and llm_skip_reason is None:
         concurrent_tail.append(_timed("llm_ms", _run_llm_layer()))
     if concurrent_tail:
         # Deliberately sequential. Both the screenshot (Chromium render) and the
@@ -553,6 +721,9 @@ async def run_analysis(
             "llm_assessment": (
                 llm_assessment.model_dump(mode="json") if llm_assessment is not None else None
             ),
+            # Present when the model was deliberately not run, so a client can
+            # say "not needed" instead of "unavailable".
+            "llm_skipped": llm_skip_reason,
             "layer_evidence": layer_snapshot(),
         }
     )
@@ -564,6 +735,13 @@ async def run_analysis(
         prefilter_score=prefilter_result["score"],
         prefilter_model_trained=bool(prefilter_result.get("model_trained")),
     )
+    # Say it in prose, in the report itself. The `degraded` code alone reads like
+    # a fault, and "no model verdict" next to a score is exactly the ambiguity
+    # that made a deliberate skip look like the Ollama server being down.
+    if llm_skip_reason:
+        scoring["explanation"] += (
+            " Local model: not consulted for this scan — " + llm_skip_reason + "."
+        )
 
     provenance = prefilter_result.get("provenance") or {}
     if prefilter_result.get("model_trained"):
@@ -672,6 +850,13 @@ async def run_analysis(
     )
 
     save_analysis(result, raw_input=raw_input)
-    cache.set_json(cache_key, result.model_dump(mode="json"))
+
+    # A degraded result is normally an environment fault — the model was still
+    # loading, Chromium could not launch, the page timed out — and caching it for
+    # the full hour meant that after the operator *fixed* the stack every scan of
+    # that URL kept being answered from the old broken report. Keep it just long
+    # enough to absorb a double click.
+    cache_ttl = settings.CACHE_TTL_SECONDS if not degraded else min(_DEGRADED_CACHE_TTL_SECONDS, settings.CACHE_TTL_SECONDS)
+    cache.set_json(cache_key, result.model_dump(mode="json"), ttl=cache_ttl)
 
     return result

@@ -49,6 +49,26 @@ class SSRFBlockedError(Exception):
     """Raised when a URL/host fails the SSRF safety checks."""
 
 
+class HostUnresolvedError(SSRFBlockedError):
+    """The hostname has no DNS records at all (NXDOMAIN / not delegated).
+
+    Distinct from an ordinary guard refusal because it is a *finding*, not a
+    security decision: an unregistered, expired or mistyped domain cannot be
+    serving a page, so a scan of it can still produce a useful report. The API
+    layer uses this subclass to keep scanning (URL/domain/LLM layers, no fetch)
+    instead of answering 400 with nothing.
+
+    It still derives from `SSRFBlockedError` so every existing caller that
+    treats "cannot resolve" as "do not fetch" keeps that behaviour — including
+    `fetch_page` and the per-layer guard inside the pipeline.
+    """
+
+    def __init__(self, hostname: str, detail: str = "") -> None:
+        self.hostname = hostname
+        suffix = f": {detail}" if detail else ""
+        super().__init__(f"DNS resolution failed for {hostname}{suffix}")
+
+
 @dataclass
 class ResolvedHost:
     hostname: str
@@ -234,7 +254,11 @@ def resolve_and_guard_host(url: str) -> ResolvedHost:
     try:
         infos = socket.getaddrinfo(hostname, None)
     except socket.gaierror as exc:
-        raise SSRFBlockedError(f"DNS resolution failed for {hostname}: {exc}") from exc
+        # A name with no records is reported as its own kind of failure so a
+        # scan can say "this domain is not registered / does not resolve" and
+        # still report on the URL string, instead of aborting the whole request
+        # with a bare 400. Nothing is ever fetched either way.
+        raise HostUnresolvedError(hostname, str(exc)) from exc
 
     ips = sorted({info[4][0] for info in infos})
     if not ips:

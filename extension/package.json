@@ -6,10 +6,14 @@
   "scripts": {
     "dev": "vite build --watch --mode development",
     "build": "vite build --config vite.config.ts && node scripts/flatten-html.mjs && vite build --config vite.config.background.ts && vite build --config vite.config.content.ts",
+    "build:firefox": "npm run build && node scripts/stage-firefox.mjs",
     "zip": "node scripts/zip-dist.mjs chrome",
+    "zip:chrome": "node scripts/zip-dist.mjs chrome",
     "zip:firefox": "node scripts/zip-dist.mjs firefox",
+    "zip:source": "node scripts/zip-source.mjs",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:content": "node scripts/check-content-bundle.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

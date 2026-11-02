@@ -1,5 +1,6 @@
 import type { AnalysisResult, HealthStatus } from "./types";
 import { normalizeAnalysisResult, normalizeTargetInput } from "./normalize";
+import { getActiveBackendBase, pendingBackendResolution } from "./backend-endpoint";
 import { loadSettings } from "./settings";
 
 export class BackendUnavailableError extends Error {
@@ -39,8 +40,23 @@ function detailFromBody(status: number, body: string): string {
   return body.trim().slice(0, 300) || `HTTP ${status}`;
 }
 
+/**
+ * The API base for this request.
+ *
+ * Set by the endpoint probe once a candidate answers (see backend-endpoint.ts),
+ * so a dashboard opened over the LAN calls the backend on the machine serving
+ * the page instead of the visitor's own `localhost`. A probe still in flight is
+ * awaited rather than raced: firing a request at the configured default while
+ * the probe is deciding is exactly how the wrong host gets used.
+ */
+async function resolveBase(): Promise<string> {
+  const probing = pendingBackendResolution();
+  if (probing) await probing.catch(() => undefined);
+  return getActiveBackendBase(loadSettings().backendUrl);
+}
+
 async function request<T>(path: string, init?: RequestInit, timeoutMs = 30_000): Promise<T> {
-  const base = loadSettings().backendUrl.replace(/\/+$/, "");
+  const base = await resolveBase();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -154,7 +170,7 @@ export const api = {
       onFinal: (result: AnalysisResult) => void;
     },
   ): Promise<void> => {
-    const base = loadSettings().backendUrl.replace(/\/+$/, "");
+    const base = await resolveBase();
     let res: Response;
     try {
       res = await fetch(`${base}/api/v1/analyze/url/stream`, {
@@ -274,5 +290,5 @@ export const api = {
       body: JSON.stringify({ analysis_id, verdict, note }),
     }),
   exportUrl: (id: string, format: "json" | "csv") =>
-    `${loadSettings().backendUrl.replace(/\/+$/, "")}/api/v1/export/${id}?format=${format}`,
+    `${getActiveBackendBase(loadSettings().backendUrl)}/api/v1/export/${id}?format=${format}`,
 };

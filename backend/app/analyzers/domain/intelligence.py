@@ -166,9 +166,30 @@ async def analyze_domain(hostname: str, timeout: float | None = None) -> LayerEv
         score += 5
         indicators.append("DNS resolution unavailable/failed for this host")
 
+    # "Does not resolve" and "does not exist" are different answers. A name
+    # with no A/AAAA record *and* no RDAP registration is not a slow host or a
+    # firewall: it is an unregistered (or lapsed) domain, which cannot serve a
+    # page at all. Naming that turns a would-be "scan failed" into a finding.
+    registration_status = "registered" if rdap["status"] == "ok" else "unknown"
+    if dns_info["status"] != "ok":
+        if rdap["status"] == "not_found":
+            registration_status = "not_registered"
+            indicators.append(
+                "No registration record for this domain (RDAP) and no DNS address — "
+                "the name is unregistered or lapsed, so no page can be served from it"
+            )
+        else:
+            registration_status = "not_resolving"
+            indicators.append(
+                "The domain has no A/AAAA record — it does not resolve, so no page could be served"
+            )
+    elif rdap["status"] == "not_found":
+        indicators.append("No public registration record (RDAP) was found for this domain")
+
     score = max(0.0, min(100.0, score))
     details = {
         "registered_domain": domain,
+        "registration_status": registration_status,
         "rdap": rdap,
         "dns": dns_info,
         "tls": tls_info,
